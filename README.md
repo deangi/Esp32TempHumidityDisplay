@@ -55,7 +55,10 @@ TempHumidityDisplay.ino - sketch file for the CYD ESP32 board.
 I used a 3D printer to make a case - printables.com has several sample cases for the CYD board.
 
 
-
+V3.0 update 16-Apr-2026
+- Added logging of temp and humidity data to internal log file with 6 minute intervals.
+- Added command interpreter to allow you to enter commands to manipulate the files in SPIFFS and see the logged data
+- On boot-up it will load previously logged data for up to the past week.
 
 
 
