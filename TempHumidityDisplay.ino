@@ -48,7 +48,7 @@
 #include "CommandHandler.h"
 
 // ─── Version ──────────────────────────────────────────────────────────────────
-#define VERSION "TempHumidityDisplay v3.0  16-Apr-2026"
+#define VERSION "TempHumidityDisplay v3.1  16-Apr-2026"
 
 // ─── Hardware ─────────────────────────────────────────────────────────────────
 #define DHT_PIN   22
