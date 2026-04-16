@@ -39,14 +39,12 @@
 #include "ESP32_SPI_9341.h"   // LovyanGFX + CYD pin/panel config
 #include <DHT.h>
 #include <SPIFFS.h>
-// Arduino only compiles .cpp files that live in the sketch folder.
-// Files in ../../Components are not on the build path, so we include
-// the .cpp files directly here to pull their implementations into this
-// compilation unit.  The headers inside each .cpp use relative includes
-// which resolve correctly to the Components directory at compile time.
-#include "../../Components/DelimitedStringParser.cpp"
-#include "../../Components/ConsoleInput.cpp"
-#include "../../Components/CommandHandler.cpp"
+// DelimitedStringParser, ConsoleInput, and CommandHandler are copied from
+// the shared Components library into this sketch folder so the Arduino build
+// system compiles them automatically alongside the sketch.
+#include "DelimitedStringParser.cpp"
+#include "ConsoleInput.cpp"
+#include "CommandHandler.cpp"
 
 // ─── Version ──────────────────────────────────────────────────────────────────
 #define VERSION "TempHumidityDisplay v3.0  16-Apr-2026"
