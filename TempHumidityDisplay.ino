@@ -40,11 +40,12 @@
 #include <DHT.h>
 #include <SPIFFS.h>
 // DelimitedStringParser, ConsoleInput, and CommandHandler are copied from
-// the shared Components library into this sketch folder so the Arduino build
-// system compiles them automatically alongside the sketch.
-#include "DelimitedStringParser.cpp"
-#include "ConsoleInput.cpp"
-#include "CommandHandler.cpp"
+// the shared Components library into this sketch folder.  The Arduino build
+// system compiles all .cpp files in the sketch folder automatically, so only
+// the headers need to be included here.
+#include "DelimitedStringParser.h"
+#include "ConsoleInput.h"
+#include "CommandHandler.h"
 
 // ─── Version ──────────────────────────────────────────────────────────────────
 #define VERSION "TempHumidityDisplay v3.0  16-Apr-2026"
