@@ -48,7 +48,7 @@
 #include "CommandHandler.h"
 
 // ─── Version ──────────────────────────────────────────────────────────────────
-#define VERSION "TempHumidityDisplay v3.1  16-Apr-2026"
+#define VERSION "TempHumidityDisplay v3.2  16-Apr-2026"
 
 // ─── Hardware ─────────────────────────────────────────────────────────────────
 #define DHT_PIN   22
@@ -74,9 +74,11 @@ static const int PLT_W = SCR_W - LM - RM;   // 250 px
 static const int PLT_H = GRF_H - TM - BM;   // 157 px
 
 // ─── Sampling ─────────────────────────────────────────────────────────────────
-// One sample every 6 min → 1680 samples = 7 days of in-memory history
-static const unsigned long SAMPLE_MS = 6UL * 60UL * 1000UL;
-static const int           MAX_SMPL  = 1680;
+// Change SAMPLE_MS to adjust the measurement interval.
+// MAX_SMPL and SAMPLES_PER_HOUR are derived automatically.
+#define SAMPLE_MS        (6UL * 60UL * 1000UL)              // measurement interval ms
+#define SAMPLES_PER_HOUR (3600000UL / SAMPLE_MS)            // samples flushed to log each hour
+#define MAX_SMPL         (int)(7UL * 24UL * SAMPLES_PER_HOUR) // 7 days of in-memory history
 
 // ─── SPIFFS / Logging ─────────────────────────────────────────────────────────
 #define LOG_PATH           "/temphumid.log"
@@ -88,8 +90,20 @@ static const unsigned long LOG_INTERVAL_MS  = 60UL * 60UL * 1000UL;
 // Check trim once per week.
 static const unsigned long TRIM_INTERVAL_MS = 7UL * 24UL * 60UL * 60UL * 1000UL;
 
+// ── millis() overflow safety ──────────────────────────────────────────────────
+// All timing comparisons use the form:  (now - lastXxx) >= interval
+// where now = millis() and all variables are unsigned long (uint32).
+// Unsigned subtraction wraps correctly at the 2^32 ms (~49.7 day) rollover,
+// so elapsed time is always computed correctly without any special handling.
+// The only requirement is that every interval must be strictly less than
+// 2^32 ms.  The static_asserts below enforce this at compile time so that
+// changing an interval to an unsafe value is caught immediately.
+static_assert(SAMPLE_MS         < 0xFFFFFFFFUL, "SAMPLE_MS must be < 2^32 ms");
+static_assert(LOG_INTERVAL_MS   < 0xFFFFFFFFUL, "LOG_INTERVAL_MS must be < 2^32 ms");
+static_assert(TRIM_INTERVAL_MS  < 0xFFFFFFFFUL, "TRIM_INTERVAL_MS must be < 2^32 ms");
+
 // 1 week of records loaded into the plot buffer on startup.
-static const int LOG_WEEK_RECS  = 1680;                          // 7×24×10
+static const int LOG_WEEK_RECS  = 7 * 24 * (int)SAMPLES_PER_HOUR;
 
 // Trim policy: if the log exceeds this size, remove one month at a time.
 static const size_t LOG_TRIM_THRESHOLD = 200000UL;               // bytes
@@ -114,10 +128,15 @@ float hBuf[MAX_SMPL];    // humidity history %
 int   nSmpl    = 0;      // total samples currently in buffer
 int   nLogSmpl = 0;      // samples loaded from log at boot (hourly spacing)
 
+// Pending buffer: accumulates 6-min readings between hourly log flushes.
+// Flushed to SPIFFS as a block once per hour, then cleared.
+uint8_t pendingT[SAMPLES_PER_HOUR];
+uint8_t pendingH[SAMPLES_PER_HOUR];
+int     pendingCount = 0;
+
 float curT = NAN, curH = NAN;
 
 bool          spiffsOk    = false;
-unsigned long lastReadMs  = 0;
 unsigned long lastSampleMs = 0;
 unsigned long lastLogMs   = 0;
 unsigned long lastTrimMs  = 0;
@@ -303,19 +322,21 @@ void loadFromSpiffs() {
                 nSmpl, totalRecs, LOG_WEEK_RECS);
 }
 
-// Append the current reading to the log file (called every hour).
+// Flush the pending buffer to the log file (called every hour).
+// Writes all readings accumulated since the last flush, then clears the buffer.
 void appendToLog() {
-  if (!spiffsOk || isnan(curT) || isnan(curH)) return;
+  if (!spiffsOk || pendingCount == 0) return;
 
   File f = SPIFFS.open(LOG_PATH, FILE_APPEND);
   if (!f) { Serial.println("SPIFFS: failed to open log for append"); return; }
 
-  uint8_t tb = (uint8_t)constrain((int)round(curT), 0, 255);
-  uint8_t hb = (uint8_t)constrain((int)round(curH), 0, 100);
-  f.write(tb);
-  f.write(hb);
+  for (int i = 0; i < pendingCount; i++) {
+    f.write(pendingT[i]);
+    f.write(pendingH[i]);
+  }
   f.close();
-  Serial.printf("SPIFFS: logged T=%d H=%d\n", (int)tb, (int)hb);
+  Serial.printf("SPIFFS: flushed %d records to log\n", pendingCount);
+  pendingCount = 0;
 }
 
 // If the log exceeds LOG_TRIM_THRESHOLD bytes, remove LOG_TRIM_BYTES (one
@@ -605,6 +626,7 @@ void setup() {
 // ─── Loop ─────────────────────────────────────────────────────────────────────
 
 void loop() {
+  // Unsigned subtraction handles millis() rollover at ~49.7 days automatically.
   unsigned long now = millis();
 
   // Poll serial input; dispatch completed lines to the command handler.
@@ -615,9 +637,9 @@ void loop() {
     if (rc != CMD_OK) Serial.println(cmd.lastErrorMsg());
   }
 
-  // Read sensor every 3 s (DHT11 max ~0.5 Hz; allow extra margin).
-  if (now - lastReadMs >= 3000UL) {
-    lastReadMs = now;
+  // Read sensor and take a sample every SAMPLE_MS.
+  if (now - lastSampleMs >= SAMPLE_MS) {
+    lastSampleMs = now;
 
     float h = dht.readHumidity();
     float t = dht.readTemperature(true);    // true → Fahrenheit
@@ -627,22 +649,14 @@ void loop() {
       curT = t;
       curH = h;
       drawHeader();
-
-      // Take the very first sample as soon as we get a valid reading.
-      if (nSmpl == 0) {
-        pushSample(curT, curH);
-        lastSampleMs = now;
-        drawGraph();
-      }
-    }
-  }
-
-  // Archive a plot sample every 6 minutes.
-  if (nSmpl > 0 && (now - lastSampleMs >= SAMPLE_MS)) {
-    lastSampleMs = now;
-    if (!isnan(curT) && !isnan(curH)) {
       pushSample(curT, curH);
       drawGraph();
+      // Accumulate in pending buffer; guard against overflow if flush is late.
+      if (pendingCount < SAMPLES_PER_HOUR) {
+        pendingT[pendingCount] = (uint8_t)constrain((int)round(curT), 0, 255);
+        pendingH[pendingCount] = (uint8_t)constrain((int)round(curH), 0, 100);
+        pendingCount++;
+      }
     }
   }
 
