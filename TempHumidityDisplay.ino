@@ -46,6 +46,7 @@
 #include "DelimitedStringParser.h"
 #include "ConsoleInput.h"
 #include "CommandHandler.h"
+#include "Smoother.h"
 
 // ─── Version ──────────────────────────────────────────────────────────────────
 #define VERSION "TempHumidityDisplay v3.2  16-Apr-2026"
@@ -77,6 +78,7 @@ static const int PLT_H = GRF_H - TM - BM;   // 157 px
 // Change SAMPLE_MS to adjust the measurement interval.
 // MAX_SMPL and SAMPLES_PER_HOUR are derived automatically.
 #define SAMPLE_MS        (6UL * 60UL * 1000UL)              // measurement interval ms
+#define SMOOTH_WIN       5                                   // MovingAverageSmoother window (samples)
 #define SAMPLES_PER_HOUR (3600000UL / SAMPLE_MS)            // samples flushed to log each hour
 #define MAX_SMPL         (int)(7UL * 24UL * SAMPLES_PER_HOUR) // 7 days of in-memory history
 
@@ -414,12 +416,6 @@ inline int valToY(float v, float vMin, float vMax) {
   return PLT_Y + PLT_H - (int)(n * PLT_H);
 }
 
-// Sample index → X pixel across the plot area.
-inline int idxToX(int i, int total) {
-  if (total <= 1) return PLT_X;
-  return PLT_X + (int)((long)i * PLT_W / (total - 1));
-}
-
 // ─── Header ───────────────────────────────────────────────────────────────────
 
 void drawHeader() {
@@ -557,16 +553,23 @@ void drawGraph() {
     tft.drawString(lbl, xPix, PLT_Y + PLT_H + 2);
   }
 
-  // ── Plot lines ──
-  for (int i = 0; i < nSmpl - 1; i++) {
-    int x1 = idxToX(i,     nSmpl);
-    int x2 = idxToX(i + 1, nSmpl);
+  // ── Plot lines — pixel-resolution cubic spline ──
+  // Static instances persist across redraws; prepare() reinitialises them.
+  // Swap CubicSplineSmoother for MovingAverageSmoother(SMOOTH_WIN) to compare.
+  static MovingAverageSmoother tSmooth(SMOOTH_WIN), hSmooth(SMOOTH_WIN);
+  tSmooth.prepare(tBuf, nSmpl);
+  hSmooth.prepare(hBuf, nSmpl);
 
-    tft.drawLine(x1, valToY(tBuf[i],     tMin, tMax),
-                 x2, valToY(tBuf[i + 1], tMin, tMax), C_TEMP);
-
-    tft.drawLine(x1, valToY(hBuf[i],     hMin, hMax),
-                 x2, valToY(hBuf[i + 1], hMin, hMax), C_HUMID);
+  float scale = (float)(nSmpl - 1) / (float)(PLT_W - 1);
+  for (int px = 0; px < PLT_W - 1; px++) {
+    float fx1 = px       * scale;
+    float fx2 = (px + 1) * scale;
+    int   sx1 = PLT_X + px;
+    int   sx2 = PLT_X + px + 1;
+    tft.drawLine(sx1, valToY(tSmooth.evaluate(fx1), tMin, tMax),
+                 sx2, valToY(tSmooth.evaluate(fx2), tMin, tMax), C_TEMP);
+    tft.drawLine(sx1, valToY(hSmooth.evaluate(fx1), hMin, hMax),
+                 sx2, valToY(hSmooth.evaluate(fx2), hMin, hMax), C_HUMID);
   }
 
   // ── Legend (top-right corner of plot) ──
