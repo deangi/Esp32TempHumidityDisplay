@@ -19,21 +19,21 @@
  *   Tools → Partition Scheme → Default (must include a SPIFFS partition)
  *
  * SPIFFS log format: /temphumid.log
- *   Binary, 2 bytes per record: [uint8 temp °F][uint8 humidity %]
- *   One record appended per 6-minute sample.
+ *   Binary, 4 bytes per record: [int16 temp×10][int16 humidity×10]
+ *   DHT11 is read every 10 s; readings are averaged over 6 minutes and
+ *   stored as int16 (value × 10) for one decimal digit of precision.
+ *   One record appended per 6-minute averaged sample.
  *
  *   Capacity math (6-min intervals):
- *     1 week  = 7 × 24 × 60 / 6 = 1680 records = 3360 bytes
- *     1 month = 4 weeks          = 6720 records = 13440 bytes
- *     1 year  = 365 × 24 × 10   = 87600 records ≈ 175200 bytes
+ *     1 week  = 7 × 24 × 10 = 1680 records =  6720 bytes
+ *     1 month = 4 weeks     = 6720 records = 26880 bytes (× 4 = 53760 w/ int16)
  *
  *   On boot:  load last 1680 records (1 week) into the plot buffer.
- *   Hourly:   append current reading to log.
- *   Weekly:   if log exceeds 200000 bytes, remove the oldest month
- *             (13440 bytes) at a time until under threshold.
- *             trimLog() heap-allocates a buffer equal to the retained data
- *             (~187 KB worst-case); ESP32 free heap (~300 KB+) handles this,
- *             but call only from setup() or the weekly timer.
+ *   Hourly:   append current averaged readings to log.
+ *   Trim:     if log exceeds 400000 bytes (~13.5 months), remove the oldest
+ *             month (53760 bytes) at a time until under threshold.
+ *             trimLog() heap-allocates a buffer equal to the retained data;
+ *             call only from setup() or the weekly timer.
  */
 
 #include "ESP32_SPI_9341.h"   // LovyanGFX + CYD pin/panel config
@@ -49,7 +49,7 @@
 #include "Smoother.h"
 
 // ─── Version ──────────────────────────────────────────────────────────────────
-#define VERSION "TempHumidityDisplay v3.2  16-Apr-2026"
+#define VERSION "TempHumidityDisplay v3.3  17-Apr-2026"
 
 // ─── Hardware ─────────────────────────────────────────────────────────────────
 #define DHT_PIN   22
@@ -75,16 +75,19 @@ static const int PLT_W = SCR_W - LM - RM;   // 250 px
 static const int PLT_H = GRF_H - TM - BM;   // 157 px
 
 // ─── Sampling ─────────────────────────────────────────────────────────────────
-// Change SAMPLE_MS to adjust the measurement interval.
-// MAX_SMPL and SAMPLES_PER_HOUR are derived automatically.
-#define SAMPLE_MS        (6UL * 60UL * 1000UL)              // measurement interval ms
-#define SMOOTH_WIN       5                                   // MovingAverageSmoother window (samples)
-#define SAMPLES_PER_HOUR (3600000UL / SAMPLE_MS)            // samples flushed to log each hour
-#define MAX_SMPL         (int)(7UL * 24UL * SAMPLES_PER_HOUR) // 7 days of in-memory history
+// FAST_SAMPLE_MS: how often the DHT11 is read and accumulated.
+// SAMPLE_MS:      the averaged plot/log interval (unchanged from v3.x).
+// FAST_PER_SAMPLE readings are averaged into each plot point.
+#define FAST_SAMPLE_MS   (10UL * 1000UL)                    // 10-second raw read interval
+#define SAMPLE_MS        (6UL * 60UL * 1000UL)              // 6-minute averaged plot interval
+#define FAST_PER_SAMPLE  (SAMPLE_MS / FAST_SAMPLE_MS)       // 36 reads per plot point
+#define SMOOTH_WIN       5                                   // MovingAverageSmoother window (if re-enabled)
+#define SAMPLES_PER_HOUR (3600000UL / SAMPLE_MS)            // 10 plot points per hour
+#define MAX_SMPL         (int)(7UL * 24UL * SAMPLES_PER_HOUR) // 1680 — 7 days of in-memory history
 
 // ─── SPIFFS / Logging ─────────────────────────────────────────────────────────
 #define LOG_PATH           "/temphumid.log"
-#define LOG_REC_BYTES      2              // [uint8 temp °F][uint8 humidity %]
+#define LOG_REC_BYTES      4              // [int16 temp×10][int16 humidity×10]
 
 // Append to log every hour (10 samples per hour × 6-min interval).
 static const unsigned long LOG_INTERVAL_MS  = 60UL * 60UL * 1000UL;
@@ -100,6 +103,7 @@ static const unsigned long TRIM_INTERVAL_MS = 7UL * 24UL * 60UL * 60UL * 1000UL;
 // The only requirement is that every interval must be strictly less than
 // 2^32 ms.  The static_asserts below enforce this at compile time so that
 // changing an interval to an unsafe value is caught immediately.
+static_assert(FAST_SAMPLE_MS    < 0xFFFFFFFFUL, "FAST_SAMPLE_MS must be < 2^32 ms");
 static_assert(SAMPLE_MS         < 0xFFFFFFFFUL, "SAMPLE_MS must be < 2^32 ms");
 static_assert(LOG_INTERVAL_MS   < 0xFFFFFFFFUL, "LOG_INTERVAL_MS must be < 2^32 ms");
 static_assert(TRIM_INTERVAL_MS  < 0xFFFFFFFFUL, "TRIM_INTERVAL_MS must be < 2^32 ms");
@@ -108,8 +112,8 @@ static_assert(TRIM_INTERVAL_MS  < 0xFFFFFFFFUL, "TRIM_INTERVAL_MS must be < 2^32
 static const int LOG_WEEK_RECS  = 7 * 24 * (int)SAMPLES_PER_HOUR;
 
 // Trim policy: if the log exceeds this size, remove one month at a time.
-static const size_t LOG_TRIM_THRESHOLD = 200000UL;               // bytes
-static const size_t LOG_TRIM_BYTES     = 13440UL;                // 1 month = 4×1680×2
+static const size_t LOG_TRIM_THRESHOLD = 100000UL * LOG_REC_BYTES;  // 400000 bytes (~13.5 months)
+static const size_t LOG_TRIM_BYTES     =  13440UL * LOG_REC_BYTES;  // 53760 bytes (1 month)
 
 // ─── Colors (RGB565) ──────────────────────────────────────────────────────────
 #define C_BG      TFT_BLACK
@@ -130,18 +134,23 @@ float hBuf[MAX_SMPL];    // humidity history %
 int   nSmpl    = 0;      // total samples currently in buffer
 int   nLogSmpl = 0;      // samples loaded from log at boot (hourly spacing)
 
-// Pending buffer: accumulates 6-min readings between hourly log flushes.
-// Flushed to SPIFFS as a block once per hour, then cleared.
-uint8_t pendingT[SAMPLES_PER_HOUR];
-uint8_t pendingH[SAMPLES_PER_HOUR];
+// Fast-sample accumulator — sums 10-second reads over one 6-minute interval.
+float         accumT     = 0.0f;
+float         accumH     = 0.0f;
+int           accumCount = 0;
+
+// Pending log buffer — averaged plot points awaiting the hourly SPIFFS flush.
+// Stored as int16 (value × 10) to match the on-disk format.
+int16_t pendingT[SAMPLES_PER_HOUR];
+int16_t pendingH[SAMPLES_PER_HOUR];
 int     pendingCount = 0;
 
 float curT = NAN, curH = NAN;
 
-bool          spiffsOk    = false;
-unsigned long lastSampleMs = 0;
-unsigned long lastLogMs   = 0;
-unsigned long lastTrimMs  = 0;
+bool          spiffsOk   = false;
+unsigned long lastFastMs = 0;   // 10-second raw read timer
+unsigned long lastLogMs  = 0;
+unsigned long lastTrimMs = 0;
 
 // ─── Serial command interface ─────────────────────────────────────────────────
 ConsoleInput  console(&Serial, 128, true);
@@ -216,12 +225,12 @@ int cmdShowLog(const DelimitedStringParser& args, String& errMsg) {
   Serial.println("temp,humidity");
 
   for (int i = 0; i < totalRecs; i++) {
-    uint8_t tb, hb;
-    if (f.read(&tb, 1) != 1 || f.read(&hb, 1) != 1) {
+    int16_t tv, hv;
+    if (f.read((uint8_t*)&tv, 2) != 2 || f.read((uint8_t*)&hv, 2) != 2) {
       Serial.printf("# unexpected EOF at record %d\n", i);
       break;
     }
-    Serial.printf("%d,%d\n", (int)tb, (int)hb);
+    Serial.printf("%.1f,%.1f\n", tv / 10.0f, hv / 10.0f);
   }
   f.close();
   return CMD_OK;
@@ -276,7 +285,7 @@ int helpHandler(const DelimitedStringParser& args, String& errMsg) {
 // starting from the beginning of the file — toLoad is capped at totalRecs.
 // Integer division on fileBytes discards any trailing partial record that may
 // have been left by a power-loss mid-write, so the read loop always sees only
-// complete 2-byte records.  The per-read return-value check provides a final
+// complete 4-byte records.  The per-read return-value check provides a final
 // safety net in case of unexpected EOF.
 void loadFromSpiffs() {
   // File won't exist on first boot or after a SPIFFS format — that is normal.
@@ -307,14 +316,14 @@ void loadFromSpiffs() {
   f.seek((size_t)(totalRecs - toLoad) * LOG_REC_BYTES);
 
   for (int i = 0; i < toLoad; i++) {
-    uint8_t tb, hb;
+    int16_t tv, hv;
     // Guard against unexpected EOF (e.g. file corruption).
-    if (f.read(&tb, 1) != 1 || f.read(&hb, 1) != 1) {
+    if (f.read((uint8_t*)&tv, 2) != 2 || f.read((uint8_t*)&hv, 2) != 2) {
       Serial.printf("SPIFFS: unexpected EOF at record %d – stopping load\n", i);
       break;
     }
-    tBuf[nSmpl] = (float)tb;
-    hBuf[nSmpl] = (float)hb;
+    tBuf[nSmpl] = tv / 10.0f;
+    hBuf[nSmpl] = hv / 10.0f;
     nSmpl++;
   }
   f.close();
@@ -333,20 +342,18 @@ void appendToLog() {
   if (!f) { Serial.println("SPIFFS: failed to open log for append"); return; }
 
   for (int i = 0; i < pendingCount; i++) {
-    f.write(pendingT[i]);
-    f.write(pendingH[i]);
+    f.write((uint8_t*)&pendingT[i], 2);
+    f.write((uint8_t*)&pendingH[i], 2);
   }
   f.close();
   Serial.printf("SPIFFS: flushed %d records to log\n", pendingCount);
   pendingCount = 0;
 }
 
-// If the log exceeds LOG_TRIM_THRESHOLD bytes, remove LOG_TRIM_BYTES (one
-// month) from the front, repeating until under the threshold.  The rewrite
-// uses a heap buffer sized to the retained data (~187 KB worst-case at max
-// log size).  ESP32 has ~300 KB+ free heap so this is fine, but trimLog()
-// should only be called from setup() or the weekly timer — never in a tight
-// loop — to avoid starving other allocations.
+// If the log exceeds LOG_TRIM_THRESHOLD (400000 bytes), remove LOG_TRIM_BYTES
+// (one month = 53760 bytes) from the front, repeating until under threshold.
+// The rewrite uses a heap buffer sized to the retained data; call only from
+// setup() or the weekly timer to avoid starving other allocations.
 void trimLog() {
   if (!spiffsOk || !SPIFFS.exists(LOG_PATH)) return;
 
@@ -553,23 +560,15 @@ void drawGraph() {
     tft.drawString(lbl, xPix, PLT_Y + PLT_H + 2);
   }
 
-  // ── Plot lines — pixel-resolution cubic spline ──
-  // Static instances persist across redraws; prepare() reinitialises them.
-  // Swap CubicSplineSmoother for MovingAverageSmoother(SMOOTH_WIN) to compare.
-  static MovingAverageSmoother tSmooth(SMOOTH_WIN), hSmooth(SMOOTH_WIN);
-  tSmooth.prepare(tBuf, nSmpl);
-  hSmooth.prepare(hBuf, nSmpl);
-
+  // ── Plot lines — raw float samples ──
   float scale = (float)(nSmpl - 1) / (float)(PLT_W - 1);
   for (int px = 0; px < PLT_W - 1; px++) {
-    float fx1 = px       * scale;
-    float fx2 = (px + 1) * scale;
-    int   sx1 = PLT_X + px;
-    int   sx2 = PLT_X + px + 1;
-    tft.drawLine(sx1, valToY(tSmooth.evaluate(fx1), tMin, tMax),
-                 sx2, valToY(tSmooth.evaluate(fx2), tMin, tMax), C_TEMP);
-    tft.drawLine(sx1, valToY(hSmooth.evaluate(fx1), hMin, hMax),
-                 sx2, valToY(hSmooth.evaluate(fx2), hMin, hMax), C_HUMID);
+    int i1 = constrain((int)roundf( px      * scale), 0, nSmpl - 1);
+    int i2 = constrain((int)roundf((px + 1) * scale), 0, nSmpl - 1);
+    tft.drawLine(PLT_X + px,     valToY(tBuf[i1], tMin, tMax),
+                 PLT_X + px + 1, valToY(tBuf[i2], tMin, tMax), C_TEMP);
+    tft.drawLine(PLT_X + px,     valToY(hBuf[i1], hMin, hMax),
+                 PLT_X + px + 1, valToY(hBuf[i2], hMin, hMax), C_HUMID);
   }
 
   // ── Legend (top-right corner of plot) ──
@@ -609,7 +608,8 @@ void setup() {
     Serial.println("SPIFFS mount failed – logging disabled");
   }
 
-  // Start timers from now: first log write in 1 hour, first trim check in 1 week.
+  // Start timers from now: first fast read immediately, log write in 1 hour.
+  lastFastMs = millis();
   lastLogMs  = millis();
   lastTrimMs = millis();
 
@@ -640,24 +640,43 @@ void loop() {
     if (rc != CMD_OK) Serial.println(cmd.lastErrorMsg());
   }
 
-  // Read sensor and take a sample every SAMPLE_MS.
-  if (now - lastSampleMs >= SAMPLE_MS) {
-    lastSampleMs = now;
+  // ── Fast read: accumulate a DHT11 sample every 10 seconds ──
+  if (now - lastFastMs >= FAST_SAMPLE_MS) {
+    lastFastMs = now;
 
     float h = dht.readHumidity();
     float t = dht.readTemperature(true);    // true → Fahrenheit
 
-    Serial.printf("Temp %f, Humidity %f\n", t, h);
     if (!isnan(t) && !isnan(h)) {
-      curT = t;
-      curH = h;
+      accumT += t;
+      accumH += h;
+      accumCount++;
+    }
+  }
+
+  // ── Plot interval: average accumulator every 6 minutes ──
+  static unsigned long lastPlotMs = 0;
+  if (lastPlotMs == 0) lastPlotMs = now;   // initialise on first loop pass
+
+  if (now - lastPlotMs >= SAMPLE_MS) {
+    lastPlotMs = now;
+
+    if (accumCount > 0) {
+      // Average and round to 1 decimal digit
+      curT = roundf((accumT / accumCount) * 10.0f) / 10.0f;
+      curH = roundf((accumH / accumCount) * 10.0f) / 10.0f;
+      Serial.printf("Temp %.1f, Humidity %.1f  (avg of %d reads)\n",
+                    curT, curH, accumCount);
+      accumT = 0.0f;  accumH = 0.0f;  accumCount = 0;
+
       drawHeader();
       pushSample(curT, curH);
       drawGraph();
-      // Accumulate in pending buffer; guard against overflow if flush is late.
-      if (pendingCount < SAMPLES_PER_HOUR) {
-        pendingT[pendingCount] = (uint8_t)constrain((int)round(curT), 0, 255);
-        pendingH[pendingCount] = (uint8_t)constrain((int)round(curH), 0, 100);
+
+      // Stage for next hourly log flush (stored as value × 10)
+      if (pendingCount < (int)SAMPLES_PER_HOUR) {
+        pendingT[pendingCount] = (int16_t)roundf(curT * 10.0f);
+        pendingH[pendingCount] = (int16_t)roundf(curH * 10.0f);
         pendingCount++;
       }
     }
