@@ -90,11 +90,19 @@ public:
             // SPIバスの設定
             cfg.spi_host = HSPI_HOST;  // 使用するSPIを選択  (VSPI_HOST or HSPI_HOST)
             cfg.spi_mode = 0;          // SPI通信モードを設定 (0 ~ 3)
-            cfg.freq_write = 40000000; // 送信時のSPIクロック (最大80MHz, 80MHzを整数で割った値に丸められます)
+            // 20 MHz (was 40 MHz).  Lowered after observing white/random-pixel
+            // boots once WiFi STA was added: 40 MHz is marginal on this CYD
+            // when WiFi association introduces SPI timing jitter, and the
+            // display only updates once per second so the extra throughput
+            // is unused.  80 MHz / 4 = 20 MHz is the next safe ESP32 divisor.
+            cfg.freq_write = 10000000;
             cfg.freq_read = 16000000;  // 受信時のSPIクロック
             cfg.spi_3wire = true;      // 受信をMOSIピンで行う場合はtrueを設定
             cfg.use_lock = true;       // トランザクションロックを使用する場合はtrueを設定
-            cfg.dma_channel = 1;       // Set the DMA channel (1 or 2. 0=disable)   使用するDMAチャンネルを設定 (0=DMA不使用)
+            // DMA disabled (was channel 1).  With WiFi STA active the SPI DMA
+            // channel was producing white/random-pixel boots; PIO transfers
+            // are plenty fast for a panel that updates only once per second.
+            cfg.dma_channel = 0;
             cfg.pin_sclk = LCD_SCK;    // SPIのSCLKピン番号を設定
             cfg.pin_mosi = LCD_MOSI;   // SPIのMOSIピン番号を設定
             cfg.pin_miso = LCD_MISO;   // SPIのMISOピン番号を設定 (-1 = disable)
@@ -127,7 +135,13 @@ public:
             cfg.invert = false;       // パネルの明暗が反転してしまう場合 trueに設定
             cfg.rgb_order = false;    // パネルの赤と青が入れ替わってしまう場合 trueに設定
             cfg.dlen_16bit = false;   // データ長を16bit単位で送信するパネルの場合 trueに設定
-            cfg.bus_shared = true;    // SDカードとバスを共有している場合 trueに設定(drawJpgFile等でバス制御を行います)
+            // bus_shared = false: this sketch does NOT share HSPI with any
+            // other device (touch is on VSPI; SPIFFS is internal flash, not
+            // SD-via-HSPI).  Setting true forces LovyanGFX to release/
+            // re-acquire the bus on every transaction, which leaves a window
+            // where a WiFi-driven interrupt storm can desync CS/DC and put
+            // the panel into a permanent garbage state at WiFi.begin() time.
+            cfg.bus_shared = false;
 
             _panel_instance.config(cfg);
         }

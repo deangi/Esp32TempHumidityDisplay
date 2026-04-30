@@ -1,0 +1,17 @@
+# Per-device WiFi credentials — NEVER commit
+data/config.ini
+
+# Manual backup zips
+*.zip
+
+# Arduino IDE / build artifacts
+build/
+*.bin
+*.elf
+*.hex
+*.map
+
+# Editor / OS junk
+.vscode/
+.DS_Store
+Thumbs.db

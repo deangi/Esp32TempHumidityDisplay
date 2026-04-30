@@ -1,4 +1,4 @@
-/*
+/*============================================================================
  * TempHumidityDisplay.ino
  *
  * Reads temperature (°F) and humidity (%) from a DHT11 on GPIO 22.
@@ -8,6 +8,8 @@
  * Hardware
  *   ESP32 CYD (Cheap Yellow Display) — single-USB version ESP32-WROOM board
  *   LovyanGFX driver at 40MHz SPI for 2.8" CYD board (Cheap Yellow Display)
+ *   (uses older model CYD with single micro-usb port)
+ *   (newer models have micro-usb and usb-c, but have different display drivers)
  *   DHT11 sensor → GPIO 22
  *
  * Libraries  (install via Arduino Library Manager)
@@ -34,22 +36,50 @@
  *             month (53760 bytes) at a time until under threshold.
  *             trimLog() heap-allocates a buffer equal to the retained data;
  *             call only from setup() or the weekly timer.
+ * ============================================================================
+ * V4.0 - 28-Apr-2026 - ideas - 
+ *  x1) add WiFi - NTP to get time/date, esp32time.h
+ *  2) log time/date with temp/humidity - change log file format
+ *  x3) display time/date
+ *  w4) update log file format with date/time, change purge limits
+ *  5) add some ftp server to allow wifi to pull data
+ *  x6) going to need a config file with wifi ssid, pwd, ftp user/pwd
+ *  7) Already have a command interpreter, perhaps add telnet as well?
+ *  x8) components to use - NtpSync,  WiFi service,  telnetserver, rgb, simplescheduler, configurationfile,delimitedstringparser
+ *  9) reboot every day at midnight or 2am
  */
 
 #include "ESP32_SPI_9341.h"   // LovyanGFX + CYD pin/panel config
 #include <DHT.h>
 #include <SPIFFS.h>
-// DelimitedStringParser, ConsoleInput, and CommandHandler are copied from
-// the shared Components library into this sketch folder.  The Arduino build
+#include <ESP32Time.h>
+// DelimitedStringParser, ConsoleInput, CommandHandler, ConfigurationFile,
+// SimpleScheduler, WiFiSvc, and NtpSync are copied from the shared Components
+// library (../../Components) into this sketch folder.  The Arduino build
 // system compiles all .cpp files in the sketch folder automatically, so only
 // the headers need to be included here.
 #include "DelimitedStringParser.h"
 #include "ConsoleInput.h"
 #include "CommandHandler.h"
+#include "ConfigurationFile.h"
+#include "SimpleScheduler.h"
+#include "WiFiSvc.h"
+#include "NtpSync.h"
 #include "Smoother.h"
 
 // ─── Version ──────────────────────────────────────────────────────────────────
-#define VERSION "TempHumidityDisplay v3.3  17-Apr-2026"
+#define VERSION "TempHumidityDisplay v4.0  30-Apr-2026"
+
+// Diagnostic: set to 0 to disable all NTP traffic (begin/poll/sync).
+// WiFi still associates so we can isolate whether the display corruption is
+// caused by NTP UDP packets or by the WiFi association itself.
+#define ENABLE_NTP   1
+
+// Diagnostic: set to 0 to skip WiFi.begin() entirely.  The WiFiSvc instance
+// is also not constructed, so onSecondTick's wifi->poll() turns into a
+// no-op (the pointer stays null).  Use this to confirm whether the display
+// corruption is caused by anything WiFi-related at all.
+#define ENABLE_WIFI  1
 
 // ─── Hardware ─────────────────────────────────────────────────────────────────
 #define DHT_PIN   22
@@ -74,46 +104,36 @@ static const int PLT_Y = GRF_Y + TM;
 static const int PLT_W = SCR_W - LM - RM;   // 250 px
 static const int PLT_H = GRF_H - TM - BM;   // 157 px
 
+// Clock strip — small date/time line tucked into the gap at the bottom of
+// the header, between the big number row and the white separator at y=HDR_H-1.
+// Font0 is ~8 px tall; the 10 px band leaves 1 px of padding above and below.
+static const int CLK_Y = 48;
+static const int CLK_H = 10;
+
 // ─── Sampling ─────────────────────────────────────────────────────────────────
-// FAST_SAMPLE_MS: how often the DHT11 is read and accumulated.
-// SAMPLE_MS:      the averaged plot/log interval (unchanged from v3.x).
-// FAST_PER_SAMPLE readings are averaged into each plot point.
-#define FAST_SAMPLE_MS   (10UL * 1000UL)                    // 10-second raw read interval
-#define SAMPLE_MS        (6UL * 60UL * 1000UL)              // 6-minute averaged plot interval
-#define FAST_PER_SAMPLE  (SAMPLE_MS / FAST_SAMPLE_MS)       // 36 reads per plot point
-#define SMOOTH_WIN       5                                   // MovingAverageSmoother window (if re-enabled)
+// Scheduling is RTC-driven (see SimpleScheduler callbacks).  The constants
+// below are kept only as scaling factors — not as elapsed-time deadlines.
+#define FAST_PERIOD_SEC  10                                 // raw DHT11 read every N sec
+#define PLOT_PERIOD_MIN  6                                  // averaged plot point every N min
+#define SAMPLE_MS        (PLOT_PERIOD_MIN * 60UL * 1000UL)  // 6-minute averaged plot interval
 #define SAMPLES_PER_HOUR (3600000UL / SAMPLE_MS)            // 10 plot points per hour
 #define MAX_SMPL         (int)(7UL * 24UL * SAMPLES_PER_HOUR) // 1680 — 7 days of in-memory history
 
 // ─── SPIFFS / Logging ─────────────────────────────────────────────────────────
-#define LOG_PATH           "/temphumid.log"
-#define LOG_REC_BYTES      4              // [int16 temp×10][int16 humidity×10]
-
-// Append to log every hour (10 samples per hour × 6-min interval).
-static const unsigned long LOG_INTERVAL_MS  = 60UL * 60UL * 1000UL;
-
-// Check trim once per week.
-static const unsigned long TRIM_INTERVAL_MS = 7UL * 24UL * 60UL * 60UL * 1000UL;
-
-// ── millis() overflow safety ──────────────────────────────────────────────────
-// All timing comparisons use the form:  (now - lastXxx) >= interval
-// where now = millis() and all variables are unsigned long (uint32).
-// Unsigned subtraction wraps correctly at the 2^32 ms (~49.7 day) rollover,
-// so elapsed time is always computed correctly without any special handling.
-// The only requirement is that every interval must be strictly less than
-// 2^32 ms.  The static_asserts below enforce this at compile time so that
-// changing an interval to an unsafe value is caught immediately.
-static_assert(FAST_SAMPLE_MS    < 0xFFFFFFFFUL, "FAST_SAMPLE_MS must be < 2^32 ms");
-static_assert(SAMPLE_MS         < 0xFFFFFFFFUL, "SAMPLE_MS must be < 2^32 ms");
-static_assert(LOG_INTERVAL_MS   < 0xFFFFFFFFUL, "LOG_INTERVAL_MS must be < 2^32 ms");
-static_assert(TRIM_INTERVAL_MS  < 0xFFFFFFFFUL, "TRIM_INTERVAL_MS must be < 2^32 ms");
+// Log format is ASCII, one line per averaged 6-min reading:
+//   YYYYMMDD-HHMM,temp,humidity\n
+// Example: 20260429-1430,72.5,45.3
+// Path moved to .csv from the old binary .log so the formats don't mix; the
+// old /temphumid.log file (if any) is orphaned and can be removed via `rm`.
+#define LOG_PATH           "/temphumid.csv"
 
 // 1 week of records loaded into the plot buffer on startup.
 static const int LOG_WEEK_RECS  = 7 * 24 * (int)SAMPLES_PER_HOUR;
 
-// Trim policy: if the log exceeds this size, remove one month at a time.
-static const size_t LOG_TRIM_THRESHOLD = 100000UL * LOG_REC_BYTES;  // 400000 bytes (~13.5 months)
-static const size_t LOG_TRIM_BYTES     =  13440UL * LOG_REC_BYTES;  // 53760 bytes (1 month)
+// Trim policy: byte-based since records are now variable-length ASCII.
+// At ~30 bytes/record this is roughly: threshold ≈ 14 weeks, chunk ≈ 1 week.
+static const size_t LOG_TRIM_THRESHOLD = 700000UL;
+static const size_t LOG_TRIM_BYTES     =  50000UL;
 
 // ─── Colors (RGB565) ──────────────────────────────────────────────────────────
 #define C_BG      TFT_BLACK
@@ -129,6 +149,26 @@ static const size_t LOG_TRIM_BYTES     =  13440UL * LOG_REC_BYTES;  // 53760 byt
 LGFX tft;
 DHT  dht(DHT_PIN, DHT_TYPE);
 
+// Real-time clock.  Holds raw UTC; timezone offset is applied at display time.
+// Seeded to 2026-01-01 00:00:01 in setup() so timestamps are sane before the
+// first NTP sync; NtpSync will overwrite this once WiFi is up.
+ESP32Time rtc(0);
+
+// All periodic work is dispatched from the RTC, not millis().  The callbacks
+// are registered in setup() and fired from scheduler.poll() in loop().
+SimpleScheduler scheduler(rtc);
+
+// WiFi station service.  Heap-allocated in setup() once the config file has
+// been read, because the WiFiSvc constructor copies ssid/password at
+// construction time and the credentials are not known until runtime.
+WiFiSvc* wifi = nullptr;
+
+// NTP time-sync service.  Bound to the global rtc; uses the default NTP pool.
+// begin() must be called only after WiFi is up — see onSecondTick() for the
+// rising-edge logic that drives that.  poll() retries until the first sync
+// succeeds, then becomes a no-op; sync() is invoked once per day to resync.
+NtpSync ntp(rtc);
+
 float tBuf[MAX_SMPL];    // temperature history °F
 float hBuf[MAX_SMPL];    // humidity history %
 int   nSmpl    = 0;      // total samples currently in buffer
@@ -140,17 +180,25 @@ float         accumH     = 0.0f;
 int           accumCount = 0;
 
 // Pending log buffer — averaged plot points awaiting the hourly SPIFFS flush.
-// Stored as int16 (value × 10) to match the on-disk format.
-int16_t pendingT[SAMPLES_PER_HOUR];
-int16_t pendingH[SAMPLES_PER_HOUR];
+// Temperature/humidity stored as int16 (value × 10) for compactness; timestamp
+// captured at sample time (NOT flush time) so each on-disk line carries the
+// minute the reading was actually taken.
+int16_t pendingT   [SAMPLES_PER_HOUR];
+int16_t pendingH   [SAMPLES_PER_HOUR];
+time_t  pendingTime[SAMPLES_PER_HOUR];
 int     pendingCount = 0;
 
 float curT = NAN, curH = NAN;
 
-bool          spiffsOk   = false;
-unsigned long lastFastMs = 0;   // 10-second raw read timer
-unsigned long lastLogMs  = 0;
-unsigned long lastTrimMs = 0;
+bool spiffsOk = false;
+
+// ─── Configuration (loaded from /config.ini on the SPIFFS partition) ──────────
+// The data/config.ini file is uploaded to SPIFFS via the Arduino "ESP32 Sketch
+// Data Upload" tool (or equivalent) and re-read on every boot.
+#define CONFIG_PATH    "/config.ini"
+#define CFG_VAL_LEN    128
+char cfgSsid[CFG_VAL_LEN] = "";
+char cfgPwd [CFG_VAL_LEN] = "";
 
 // ─── Serial command interface ─────────────────────────────────────────────────
 ConsoleInput  console(&Serial, 128, true);
@@ -208,7 +256,7 @@ void appendFile(fs::FS& fs, const char* path, const char* message) {
 
 // ─── Serial command handlers ──────────────────────────────────────────────────
 
-// showlog — dump /temphumid.log to Serial as CSV (temp,humidity per line).
+// showlog — dump the log file (ASCII CSV: timestamp,temp,humidity per line).
 int cmdShowLog(const DelimitedStringParser& args, String& errMsg) {
   if (!spiffsOk) { errMsg = "SPIFFS not available"; return 1; }
   if (!SPIFFS.exists(LOG_PATH)) { errMsg = "log file does not exist"; return 1; }
@@ -219,19 +267,9 @@ int cmdShowLog(const DelimitedStringParser& args, String& errMsg) {
   size_t fileBytes = f.size();
   if (fileBytes == 0) { f.close(); Serial.println("(log file is empty)"); return CMD_OK; }
 
-  int totalRecs = (int)(fileBytes / LOG_REC_BYTES);
-  Serial.printf("# temphumid.log  %d records  %u bytes\n",
-                totalRecs, (unsigned)fileBytes);
-  Serial.println("temp,humidity");
-
-  for (int i = 0; i < totalRecs; i++) {
-    int16_t tv, hv;
-    if (f.read((uint8_t*)&tv, 2) != 2 || f.read((uint8_t*)&hv, 2) != 2) {
-      Serial.printf("# unexpected EOF at record %d\n", i);
-      break;
-    }
-    Serial.printf("%.1f,%.1f\n", tv / 10.0f, hv / 10.0f);
-  }
+  Serial.printf("# %s  %u bytes\n", LOG_PATH, (unsigned)fileBytes);
+  Serial.println("timestamp,temp,humidity");
+  while (f.available()) Serial.write(f.read());
   f.close();
   return CMD_OK;
 }
@@ -277,64 +315,72 @@ int helpHandler(const DelimitedStringParser& args, String& errMsg) {
 
 // ─── SPIFFS helpers ───────────────────────────────────────────────────────────
 
-// On boot: read the last 1680 records (1 week) from the log into the sample
-// buffer so the graph is populated immediately.
-//
-// Truncated log: if the file holds fewer than LOG_WEEK_RECS records (e.g. the
-// device is new, or the log was just trimmed), all available records are loaded
-// starting from the beginning of the file — toLoad is capped at totalRecs.
-// Integer division on fileBytes discards any trailing partial record that may
-// have been left by a power-loss mid-write, so the read loop always sees only
-// complete 4-byte records.  The per-read return-value check provides a final
-// safety net in case of unexpected EOF.
+// On boot: read the last LOG_WEEK_RECS lines from the ASCII log into the
+// sample buffer so the graph is populated immediately.  Two-pass approach:
+// pass 1 counts newlines; pass 2 skips the leading lines we don't need and
+// parses the remainder.  Avoids needing record-offset metadata or holding
+// the whole file in RAM, at the cost of reading the file twice.
 void loadFromSpiffs() {
-  // File won't exist on first boot or after a SPIFFS format — that is normal.
   if (!SPIFFS.exists(LOG_PATH)) {
     Serial.println("SPIFFS: no log file found – starting fresh");
     return;
   }
 
   File f = SPIFFS.open(LOG_PATH, FILE_READ);
-  if (!f) {                           // filesystem error despite file existing
+  if (!f) {
     Serial.println("SPIFFS: failed to open log for reading");
     return;
   }
-
-  size_t fileBytes = f.size();
-  if (fileBytes == 0) {               // file exists but is empty
+  if (f.size() == 0) {
     f.close();
     Serial.println("SPIFFS: log file is empty");
     return;
   }
 
-  int    totalRecs = (int)(fileBytes / LOG_REC_BYTES); // integer division drops any partial trailing record
-  int    toLoad    = min(totalRecs, LOG_WEEK_RECS);    // cap at 1 week; handles truncated log naturally
-  if (toLoad == 0) { f.close(); return; }
+  // Pass 1: count newline-terminated lines.
+  int totalLines = 0;
+  while (f.available()) {
+    if (f.read() == '\n') totalLines++;
+  }
+  if (totalLines == 0) { f.close(); return; }
 
-  // When toLoad == totalRecs (truncated log) this seek resolves to 0,
-  // i.e. we read from the start of the file.
-  f.seek((size_t)(totalRecs - toLoad) * LOG_REC_BYTES);
+  int toSkip = (totalLines > LOG_WEEK_RECS) ? (totalLines - LOG_WEEK_RECS) : 0;
 
-  for (int i = 0; i < toLoad; i++) {
-    int16_t tv, hv;
-    // Guard against unexpected EOF (e.g. file corruption).
-    if (f.read((uint8_t*)&tv, 2) != 2 || f.read((uint8_t*)&hv, 2) != 2) {
-      Serial.printf("SPIFFS: unexpected EOF at record %d – stopping load\n", i);
-      break;
+  // Pass 2: rewind, skip leading lines, parse the rest.
+  f.seek(0);
+  while (toSkip > 0 && f.available()) {
+    if (f.read() == '\n') toSkip--;
+  }
+
+  String line;
+  line.reserve(40);
+  while (f.available() && nSmpl < MAX_SMPL) {
+    char c = (char)f.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      // Expect: YYYYMMDD-HHMM,temp,humidity  (timestamp ignored on load)
+      int c1 = line.indexOf(',');
+      int c2 = line.indexOf(',', c1 + 1);
+      if (c1 > 0 && c2 > c1) {
+        tBuf[nSmpl] = line.substring(c1 + 1, c2).toFloat();
+        hBuf[nSmpl] = line.substring(c2 + 1).toFloat();
+        nSmpl++;
+      }
+      line = "";
+    } else {
+      line += c;
     }
-    tBuf[nSmpl] = tv / 10.0f;
-    hBuf[nSmpl] = hv / 10.0f;
-    nSmpl++;
   }
   f.close();
 
   nLogSmpl = nSmpl;
   Serial.printf("SPIFFS: loaded %d of %d available records (week capacity %d)\n",
-                nSmpl, totalRecs, LOG_WEEK_RECS);
+                nSmpl, totalLines, LOG_WEEK_RECS);
 }
 
 // Flush the pending buffer to the log file (called every hour).
-// Writes all readings accumulated since the last flush, then clears the buffer.
+// Writes all readings accumulated since the last flush as ASCII lines, then
+// clears the buffer.  Format: YYYYMMDD-HHMM,temp,humidity\n
 void appendToLog() {
   if (!spiffsOk || pendingCount == 0) return;
 
@@ -342,18 +388,25 @@ void appendToLog() {
   if (!f) { Serial.println("SPIFFS: failed to open log for append"); return; }
 
   for (int i = 0; i < pendingCount; i++) {
-    f.write((uint8_t*)&pendingT[i], 2);
-    f.write((uint8_t*)&pendingH[i], 2);
+    struct tm tm;
+    time_t t = pendingTime[i];
+    gmtime_r(&t, &tm);
+    f.printf("%04d%02d%02d-%02d%02d,%.1f,%.1f\n",
+             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+             tm.tm_hour, tm.tm_min,
+             pendingT[i] / 10.0f, pendingH[i] / 10.0f);
   }
   f.close();
   Serial.printf("SPIFFS: flushed %d records to log\n", pendingCount);
   pendingCount = 0;
 }
 
-// If the log exceeds LOG_TRIM_THRESHOLD (400000 bytes), remove LOG_TRIM_BYTES
-// (one month = 53760 bytes) from the front, repeating until under threshold.
-// The rewrite uses a heap buffer sized to the retained data; call only from
-// setup() or the weekly timer to avoid starving other allocations.
+// If the log exceeds LOG_TRIM_THRESHOLD bytes, drop chunks of LOG_TRIM_BYTES
+// from the front until under threshold.  Records are variable-length ASCII
+// lines, so the drop point is rounded UP to the next newline so the kept
+// portion always starts at the beginning of a record.  The rewrite uses a
+// heap buffer sized to the retained data; call only from setup() or the
+// daily timer to avoid starving other allocations.
 void trimLog() {
   if (!spiffsOk || !SPIFFS.exists(LOG_PATH)) return;
 
@@ -364,26 +417,31 @@ void trimLog() {
 
   if (fileBytes <= LOG_TRIM_THRESHOLD) return;  // nothing to do
 
-  // Calculate how many months to drop so we land under the threshold.
+  // Pick a tentative drop size that puts us under threshold.
   size_t dropBytes = 0;
   while (fileBytes - dropBytes > LOG_TRIM_THRESHOLD) {
     dropBytes += LOG_TRIM_BYTES;
   }
-  // Align to record boundary (LOG_REC_BYTES = 2, so already aligned, but be safe).
-  dropBytes = (dropBytes / LOG_REC_BYTES) * LOG_REC_BYTES;
-  if (dropBytes >= fileBytes) return;   // shouldn't happen; guard anyway
+  if (dropBytes >= fileBytes) return;   // guard against an empty result
 
-  size_t keepBytes = fileBytes - dropBytes;
-
-  Serial.printf("SPIFFS: trimming log (%u bytes, dropping %u, keeping %u)\n",
-                (unsigned)fileBytes, (unsigned)dropBytes, (unsigned)keepBytes);
-
+  // Align dropBytes to the next newline so we don't split a record.
   f = SPIFFS.open(LOG_PATH, FILE_READ);
   if (!f) return;
   f.seek(dropBytes);
+  while (f.available()) {
+    char c = (char)f.read();
+    dropBytes++;
+    if (c == '\n') break;
+  }
+  if (dropBytes >= fileBytes) { f.close(); return; }
+
+  size_t keepBytes = fileBytes - dropBytes;
+  Serial.printf("SPIFFS: trimming log (%u bytes, dropping %u, keeping %u)\n",
+                (unsigned)fileBytes, (unsigned)dropBytes, (unsigned)keepBytes);
 
   uint8_t* buf = new uint8_t[keepBytes];
-  size_t   got = f.read(buf, keepBytes);
+  if (!buf) { f.close(); return; }
+  size_t got = f.read(buf, keepBytes);
   f.close();
 
   f = SPIFFS.open(LOG_PATH, FILE_WRITE);
@@ -426,6 +484,10 @@ inline int valToY(float v, float vMin, float vMax) {
 // ─── Header ───────────────────────────────────────────────────────────────────
 
 void drawHeader() {
+  // Hold the SPI bus for the entire function so WiFi-driven interrupts on
+  // Core 0 can't land between the dozens of small LovyanGFX transactions
+  // and desync the panel's CS/DC framing.
+  tft.startWrite();
   tft.fillRect(0, 0, SCR_W, HDR_H - 1, C_HDR_BG);
 
   // ── Temperature panel (left half) ──
@@ -481,11 +543,35 @@ void drawHeader() {
 
   // ── Bottom border ──
   tft.drawFastHLine(0, HDR_H - 1, SCR_W, C_WHITE);
+  tft.endWrite();
+}
+
+// ─── Clock ────────────────────────────────────────────────────────────────────
+// Refreshes only the small date/time strip in the header.  Called once per
+// second from onSecondTick(); cheap because it overwrites only ~10 px tall.
+// Uses 24-hour format (%H, not %I).
+void drawClock() {
+  String dt = rtc.getTime("%m/%d/%Y %H:%M:%S");
+
+  // Bracket fillRect + drawString as one atomic SPI session so WiFi
+  // interrupts can't slip between them and desync the panel.
+  tft.startWrite();
+  tft.fillRect(0, CLK_Y, SCR_W, CLK_H, C_HDR_BG);
+  tft.setTextColor(C_WHITE, C_HDR_BG);
+  tft.setTextDatum(lgfx::middle_center);
+  tft.setFont(&fonts::Font0);
+  tft.drawString(dt, SCR_W / 2, CLK_Y + CLK_H / 2);
+  tft.endWrite();
 }
 
 // ─── Graph ────────────────────────────────────────────────────────────────────
 
 void drawGraph() {
+  // Hold the SPI bus across all the small draw calls below.  drawGraph
+  // issues hundreds of fillRect/drawString/drawLine ops; each one is its
+  // own SPI transaction by default, and any of those inter-call gaps can
+  // be hit by a WiFi-driven interrupt that desyncs the panel.
+  tft.startWrite();
   tft.fillRect(0, GRF_Y, SCR_W, GRF_H, C_BG);
 
   if (nSmpl < 2) {
@@ -493,6 +579,7 @@ void drawGraph() {
     tft.setTextDatum(lgfx::middle_center);
     tft.setFont(&fonts::Font2);
     tft.drawString("Collecting data...", SCR_W / 2, GRF_Y + GRF_H / 2);
+    tft.endWrite();
     return;
   }
 
@@ -583,6 +670,112 @@ void drawGraph() {
   tft.drawFastHLine(lx,      ly + 16, 10, C_HUMID);
   tft.setTextColor(C_HUMID, C_BG);
   tft.drawString("Humid", lx + 13, ly + 16);
+  tft.endWrite();
+}
+
+// ─── Scheduler callbacks ──────────────────────────────────────────────────────
+// All periodic work is driven off the RTC via SimpleScheduler.  Each callback
+// fires on a clean wall-clock boundary (e.g. seconds divisible by 10) rather
+// than millis() elapsed time.
+
+// Every 10 seconds: read the DHT11 and accumulate into the 6-minute averager.
+// Also drives the WiFi state machine on every tick (it expects 1 Hz polling).
+void onSecondTick() {
+  if (wifi) wifi->poll();
+
+#if ENABLE_NTP
+  // Initial NTP sync: once, the first time WiFi comes up.  begin() runs once
+  // for the lifetime of the program; poll() keeps retrying only until the
+  // first sync succeeds, then becomes a no-op.  Thereafter the daily resync
+  // from onDayTick is the only NTP traffic.  Run BEFORE the panel-recovery
+  // block so the long tft.init() inside recovery can't push the first NTP
+  // packet past lwIP's ready window.
+  static bool ntpInitialized = false;
+  if (wifi && wifi->isConnected()) {
+    if (!ntpInitialized) {
+      Serial.println("NTP: starting");
+      ntp.begin();
+      ntpInitialized = true;
+    }
+    if (!ntp.isSynced()) ntp.poll();
+  }
+#endif
+
+  // Recover the panel after WiFi associates.  WiFi association on the older
+  // single-USB CYD reliably leaves the ILI9341 in a desynced state (white
+  // screen / random stripes), even when our own SPI accesses are atomic.
+  // Re-running tft.init() once on the rising edge of WiFi connection
+  // issues SWRESET + the full init sequence, restoring the panel; we then
+  // redraw everything that should be on screen.  Sticky: only fires once.
+  static bool panelRecovered = false;
+  if (!panelRecovered && wifi && wifi->isConnected()) {
+    tft.init();
+    tft.setRotation(1);
+    tft.setBrightness(200);
+    tft.fillScreen(C_BG);
+    drawHeader();
+    drawClock();
+    drawGraph();
+    panelRecovered = true;
+  }
+
+  // Refresh the on-screen clock every second.
+  drawClock();
+
+  if (rtc.getSecond() % FAST_PERIOD_SEC != 0) return;
+
+  float h = dht.readHumidity();
+  float t = dht.readTemperature(true);    // true → Fahrenheit
+
+  if (!isnan(t) && !isnan(h)) {
+    accumT += t;
+    accumH += h;
+    accumCount++;
+  }
+}
+
+// Every 6 minutes: average the accumulator, redraw, stage for hourly flush.
+void onMinuteTick() {
+  if (rtc.getMinute() % PLOT_PERIOD_MIN != 0) return;
+
+  if (accumCount == 0) return;
+
+  // Average and round to 1 decimal digit.
+  curT = roundf((accumT / accumCount) * 10.0f) / 10.0f;
+  curH = roundf((accumH / accumCount) * 10.0f) / 10.0f;
+  Serial.printf("Temp %.1f, Humidity %.1f  (avg of %d reads)\n",
+                curT, curH, accumCount);
+  accumT = 0.0f;  accumH = 0.0f;  accumCount = 0;
+
+  drawHeader();
+  pushSample(curT, curH);
+  drawGraph();
+
+  // Stage for next hourly log flush.  Capture the timestamp NOW so the
+  // on-disk record reflects when the reading was averaged, not when the
+  // hourly flush happens to fire.
+  if (pendingCount < (int)SAMPLES_PER_HOUR) {
+    pendingTime[pendingCount] = rtc.getEpoch();
+    pendingT   [pendingCount] = (int16_t)roundf(curT * 10.0f);
+    pendingH   [pendingCount] = (int16_t)roundf(curH * 10.0f);
+    pendingCount++;
+  }
+}
+
+// Every hour: flush the pending averaged readings to the SPIFFS log.
+void onHourTick() {
+  appendToLog();
+}
+
+// Daily at 02:00: trim the log if it has grown past the threshold, and
+// force a fresh NTP resync to correct any RTC drift accumulated over 24 h.
+// trimLog() is a no-op below threshold, so daily firing is safe and cheaper
+// than the previous weekly polling block.
+void onDayTick() {
+  trimLog();
+#if ENABLE_NTP
+  if (wifi && wifi->isConnected()) ntp.sync();
+#endif
 }
 
 // ─── Setup ────────────────────────────────────────────────────────────────────
@@ -591,9 +784,21 @@ void setup() {
   Serial.begin(115200);
   Serial.println(VERSION);
 
+  // Seed the RTC to a known sane epoch (2026-01-01 00:00:01) so any timestamp
+  // taken before NTP sync is at least monotonic and after the build date.
+  // ESP32Time::setTime args are: sec, min, hour, day, month, year.
+  rtc.setTime(1, 0, 0, 1, 1, 2026);
+  Serial.printf("RTC seeded: %s\n", rtc.getDateTime().c_str());
+
   tft.init();
   tft.setRotation(1);       // landscape; USB port on left
   tft.setBrightness(200);   // LovyanGFX controls backlight via PWM on pin 21
+
+  // Boot color sweep: RED → GREEN → BLUE → BLACK so panel health is
+  // visible before any other code runs.
+  tft.fillScreen(TFT_RED);   delay(500);
+  tft.fillScreen(TFT_GREEN); delay(500);
+  tft.fillScreen(TFT_BLUE);  delay(500);
   tft.fillScreen(C_BG);
 
   dht.begin();
@@ -602,16 +807,43 @@ void setup() {
   spiffsOk = SPIFFS.begin(true);
   if (spiffsOk) {
     Serial.println("SPIFFS mounted");
+
+    // Read /config.ini.  Missing keys leave the buffers as empty strings so
+    // downstream code can detect "not configured" without an extra flag.
+    ConfigurationFile config(CONFIG_PATH);
+    config.get("SSID",     cfgSsid, sizeof(cfgSsid));
+    config.get("PASSWORD", cfgPwd,  sizeof(cfgPwd));
+
     loadFromSpiffs();   // pre-fill plot buffer with last week of history
     trimLog();          // trim at boot if log is already oversized
   } else {
     Serial.println("SPIFFS mount failed – logging disabled");
   }
 
-  // Start timers from now: first fast read immediately, log write in 1 hour.
-  lastFastMs = millis();
-  lastLogMs  = millis();
-  lastTrimMs = millis();
+#if ENABLE_WIFI
+  // Bring up WiFi using the credentials read from /config.ini.  WiFiSvc owns
+  // a state machine that retries on timeout and reconnects on link drop; it
+  // is driven by the scheduler's onSecondTick once registered below.
+  if (cfgSsid[0] != '\0') {
+    wifi = new WiFiSvc(cfgSsid, cfgPwd);
+    // Lower the radio TX power BEFORE WiFi.begin() inside wifi->connect()
+    // so the very first probe/auth packets don't peak at default +19.5 dBm.
+    WiFi.mode(WIFI_STA);
+    WiFi.setTxPower(WIFI_POWER_8_5dBm);
+    wifi->connect();
+  } else {
+    Serial.println("WiFi: no SSID configured – skipping connect");
+  }
+#else
+  Serial.println("WiFi: ENABLE_WIFI=0, skipping all WiFi init");
+#endif
+
+  // Wire up RTC-driven scheduling.  Each callback decides for itself whether
+  // the current tick is a hit (e.g. seconds % 10 == 0) — see callback bodies.
+  scheduler.onSecond(onSecondTick);
+  scheduler.onMinute(onMinuteTick);
+  scheduler.onHour  (onHourTick);
+  scheduler.onDay   (onDayTick);
 
   // Register serial commands.
   cmd.addCommand("showlog", cmdShowLog, "dump log file as CSV (temp,humidity)");
@@ -623,15 +855,13 @@ void setup() {
   cmd.addCommand("help",    helpHandler,"list available commands");
 
   drawHeader();
+  drawClock();
   drawGraph();
 }
 
 // ─── Loop ─────────────────────────────────────────────────────────────────────
 
 void loop() {
-  // Unsigned subtraction handles millis() rollover at ~49.7 days automatically.
-  unsigned long now = millis();
-
   // Poll serial input; dispatch completed lines to the command handler.
   console.poll();
   const char* line = console.getLine();
@@ -640,57 +870,6 @@ void loop() {
     if (rc != CMD_OK) Serial.println(cmd.lastErrorMsg());
   }
 
-  // ── Fast read: accumulate a DHT11 sample every 10 seconds ──
-  if (now - lastFastMs >= FAST_SAMPLE_MS) {
-    lastFastMs = now;
-
-    float h = dht.readHumidity();
-    float t = dht.readTemperature(true);    // true → Fahrenheit
-
-    if (!isnan(t) && !isnan(h)) {
-      accumT += t;
-      accumH += h;
-      accumCount++;
-    }
-  }
-
-  // ── Plot interval: average accumulator every 6 minutes ──
-  static unsigned long lastPlotMs = 0;
-  if (lastPlotMs == 0) lastPlotMs = now;   // initialise on first loop pass
-
-  if (now - lastPlotMs >= SAMPLE_MS) {
-    lastPlotMs = now;
-
-    if (accumCount > 0) {
-      // Average and round to 1 decimal digit
-      curT = roundf((accumT / accumCount) * 10.0f) / 10.0f;
-      curH = roundf((accumH / accumCount) * 10.0f) / 10.0f;
-      Serial.printf("Temp %.1f, Humidity %.1f  (avg of %d reads)\n",
-                    curT, curH, accumCount);
-      accumT = 0.0f;  accumH = 0.0f;  accumCount = 0;
-
-      drawHeader();
-      pushSample(curT, curH);
-      drawGraph();
-
-      // Stage for next hourly log flush (stored as value × 10)
-      if (pendingCount < (int)SAMPLES_PER_HOUR) {
-        pendingT[pendingCount] = (int16_t)roundf(curT * 10.0f);
-        pendingH[pendingCount] = (int16_t)roundf(curH * 10.0f);
-        pendingCount++;
-      }
-    }
-  }
-
-  // Append one record to SPIFFS log every hour.
-  if (now - lastLogMs >= LOG_INTERVAL_MS) {
-    lastLogMs = now;
-    appendToLog();
-  }
-
-  // Once a week check whether the log needs trimming.
-  if (now - lastTrimMs >= TRIM_INTERVAL_MS) {
-    lastTrimMs = now;
-    trimLog();
-  }
+  // Fire any due RTC-driven events (fast read, plot, log flush, trim).
+  scheduler.poll();
 }
