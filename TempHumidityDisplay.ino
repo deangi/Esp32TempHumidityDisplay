@@ -39,10 +39,15 @@
  * ============================================================================
  * V4.0 - 28-Apr-2026 - ideas - 
  *  x1) add WiFi - NTP to get time/date, esp32time.h
- *  2) log time/date with temp/humidity - change log file format
+ *  x2) log time/date with temp/humidity - change log file format
  *  x3) display time/date
- *  w4) update log file format with date/time, change purge limits
- *  5) add some ftp server to allow wifi to pull data
+ *  x4) update log file format with date/time, change purge limits
+ *  x5) add some ftp server to allow wifi to pull data - actually added web service
+ *      curl http://192.168.x.y/log >temphumid.csv
+ *      curl http://192.168.x.y/config >config.ini
+ *      curl -T config.ini http://192.168.x.y/config
+ *      curl -T temphumid.csv http://192.168.x.y/log
+ *      about 150kb max for put
  *  x6) going to need a config file with wifi ssid, pwd, ftp user/pwd
  *  7) Already have a command interpreter, perhaps add telnet as well?
  *  x8) components to use - NtpSync,  WiFi service,  telnetserver, rgb, simplescheduler, configurationfile,delimitedstringparser
@@ -53,6 +58,7 @@
 #include <DHT.h>
 #include <SPIFFS.h>
 #include <ESP32Time.h>
+#include <WebServer.h>
 // DelimitedStringParser, ConsoleInput, CommandHandler, ConfigurationFile,
 // SimpleScheduler, WiFiSvc, and NtpSync are copied from the shared Components
 // library (../../Components) into this sketch folder.  The Arduino build
@@ -68,7 +74,8 @@
 #include "Smoother.h"
 
 // ─── Version ──────────────────────────────────────────────────────────────────
-#define VERSION "TempHumidityDisplay v4.0  30-Apr-2026"
+#define VERSION       "TempHumidityDisplay v4.1  30-Apr-2026"
+#define VERSION_SHORT "v4.1"
 
 // Diagnostic: set to 0 to disable all NTP traffic (begin/poll/sync).
 // WiFi still associates so we can isolate whether the display corruption is
@@ -97,12 +104,21 @@ static const int GRF_H = SCR_H - HDR_H; // 180 px (bottom ¾)
 static const int LM = 38;               // left   (temp labels)
 static const int RM = 32;               // right  (humidity labels)
 static const int TM =  5;               // top
-static const int BM = 18;               // bottom (time labels)
+// BM bumped from 18 → 26 to free 8 px at the bottom for the status line
+// (WiFi state on the left, version on the right).  Time tick labels still
+// draw at PLT_Y + PLT_H + 2 and now sit cleanly above the status row.
+static const int BM = 26;               // bottom (time labels + status line)
 
 static const int PLT_X = LM;
 static const int PLT_Y = GRF_Y + TM;
 static const int PLT_W = SCR_W - LM - RM;   // 250 px
-static const int PLT_H = GRF_H - TM - BM;   // 157 px
+static const int PLT_H = GRF_H - TM - BM;   // 149 px
+
+// Status line — bottom 8 px of the screen.  WiFi status (left) and version
+// (right) drawn in Font0 (~8 px tall).  Refreshed once per second from
+// onSecondTick and after every panel re-init.
+static const int STAT_H = 8;
+static const int STAT_Y = SCR_H - STAT_H;
 
 // Clock strip — small date/time line tucked into the gap at the bottom of
 // the header, between the big number row and the white separator at y=HDR_H-1.
@@ -169,10 +185,18 @@ WiFiSvc* wifi = nullptr;
 // succeeds, then becomes a no-op; sync() is invoked once per day to resync.
 NtpSync ntp(rtc);
 
-float tBuf[MAX_SMPL];    // temperature history °F
-float hBuf[MAX_SMPL];    // humidity history %
-int   nSmpl    = 0;      // total samples currently in buffer
-int   nLogSmpl = 0;      // samples loaded from log at boot (hourly spacing)
+// HTTP server for remote GET/PUT of the log file and config.ini.  Started
+// only when WiFi is up (see lifecycle in onSecondTick); stopped on link loss.
+// handleClient() is pumped from loop() so HTTP latency isn't gated on the
+// 1-second scheduler tick.
+WebServer webServer(80);
+bool      httpServerActive = false;
+
+float  tBuf[MAX_SMPL];     // temperature history °F
+float  hBuf[MAX_SMPL];     // humidity history %
+time_t timeBuf[MAX_SMPL];  // capture time of each sample (Unix epoch, UTC)
+int    nSmpl    = 0;       // total samples currently in buffer
+int    nLogSmpl = 0;       // samples loaded from log at boot (hourly spacing)
 
 // Fast-sample accumulator — sums 10-second reads over one 6-minute interval.
 float         accumT     = 0.0f;
@@ -255,6 +279,34 @@ void appendFile(fs::FS& fs, const char* path, const char* message) {
 }
 
 // ─── Serial command handlers ──────────────────────────────────────────────────
+
+// Parse a log line's leading "YYYYMMDD-HHMM" timestamp into a Unix epoch
+// (UTC).  Returns 0 if the prefix isn't a valid timestamp, in which case the
+// caller should skip the line.  Done with manual digit math (not mktime) so
+// we don't depend on the system TZ being UTC.
+time_t parseLogTimestamp(const char* s) {
+  if (!s || strlen(s) < 13 || s[8] != '-') return 0;
+  for (int i = 0; i < 13; i++) {
+    if (i == 8) continue;
+    if (s[i] < '0' || s[i] > '9') return 0;
+  }
+  int y  = (s[0]-'0')*1000 + (s[1]-'0')*100 + (s[2]-'0')*10 + (s[3]-'0');
+  int mo = (s[4]-'0')*10 + (s[5]-'0');
+  int d  = (s[6]-'0')*10 + (s[7]-'0');
+  int hh = (s[9]-'0')*10 + (s[10]-'0');
+  int mm = (s[11]-'0')*10 + (s[12]-'0');
+  if (y < 2020 || y > 2100 || mo < 1 || mo > 12 || d < 1 || d > 31
+      || hh > 23 || mm > 59) return 0;
+
+  // Howard Hinnant's days_from_civil — exact, no leap-table lookup.
+  int yy = y - (mo <= 2 ? 1 : 0);
+  int era = (yy >= 0 ? yy : yy - 399) / 400;
+  unsigned yoe = (unsigned)(yy - era * 400);
+  unsigned doy = (153 * (mo > 2 ? mo - 3 : mo + 9) + 2) / 5 + d - 1;
+  unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  long days = (long)era * 146097L + (long)doe - 719468L;
+  return (time_t)(days * 86400L + (long)hh * 3600L + (long)mm * 60L);
+}
 
 // showlog — dump the log file (ASCII CSV: timestamp,temp,humidity per line).
 int cmdShowLog(const DelimitedStringParser& args, String& errMsg) {
@@ -358,13 +410,20 @@ void loadFromSpiffs() {
     char c = (char)f.read();
     if (c == '\r') continue;
     if (c == '\n') {
-      // Expect: YYYYMMDD-HHMM,temp,humidity  (timestamp ignored on load)
+      // Expect: YYYYMMDD-HHMM,temp,humidity
       int c1 = line.indexOf(',');
       int c2 = line.indexOf(',', c1 + 1);
       if (c1 > 0 && c2 > c1) {
-        tBuf[nSmpl] = line.substring(c1 + 1, c2).toFloat();
-        hBuf[nSmpl] = line.substring(c2 + 1).toFloat();
-        nSmpl++;
+        time_t ts = parseLogTimestamp(line.c_str());
+        if (ts > 0) {
+          // The on-disk timestamp is local wall-clock time (see appendToLog).
+          // Convert back to UTC for in-memory storage so timeBuf[] stays in
+          // a single canonical timezone regardless of future TZ changes.
+          timeBuf[nSmpl] = ts - rtc.offset;
+          tBuf   [nSmpl] = line.substring(c1 + 1, c2).toFloat();
+          hBuf   [nSmpl] = line.substring(c2 + 1).toFloat();
+          nSmpl++;
+        }
       }
       line = "";
     } else {
@@ -389,7 +448,9 @@ void appendToLog() {
 
   for (int i = 0; i < pendingCount; i++) {
     struct tm tm;
-    time_t t = pendingTime[i];
+    // pendingTime[i] is UTC; add rtc.offset so the on-disk timestamp is
+    // local wall-clock time, which is what someone reviewing the log expects.
+    time_t t = pendingTime[i] + rtc.offset;
     gmtime_r(&t, &tm);
     f.printf("%04d%02d%02d-%02d%02d,%.1f,%.1f\n",
              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
@@ -455,19 +516,22 @@ void trimLog() {
 
 // ─── Data management ──────────────────────────────────────────────────────────
 
-// Append a sample; when full, shift the oldest out (O(n) every 6 min – fine).
-// Decrement nLogSmpl when a log-loaded sample is evicted so the time span
-// calculation in drawGraph() stays accurate.
-void pushSample(float t, float h) {
+// Append a sample with its capture timestamp; when full, shift the oldest
+// out (O(n) every 6 min – fine).  All three parallel arrays move together.
+// Decrement nLogSmpl when a log-loaded sample is evicted.
+void pushSample(time_t ts, float t, float h) {
   if (nSmpl < MAX_SMPL) {
-    tBuf[nSmpl] = t;
-    hBuf[nSmpl] = h;
+    timeBuf[nSmpl] = ts;
+    tBuf   [nSmpl] = t;
+    hBuf   [nSmpl] = h;
     ++nSmpl;
   } else {
-    memmove(tBuf, tBuf + 1, (MAX_SMPL - 1) * sizeof(float));
-    memmove(hBuf, hBuf + 1, (MAX_SMPL - 1) * sizeof(float));
-    tBuf[MAX_SMPL - 1] = t;
-    hBuf[MAX_SMPL - 1] = h;
+    memmove(timeBuf, timeBuf + 1, (MAX_SMPL - 1) * sizeof(timeBuf[0]));
+    memmove(tBuf,    tBuf    + 1, (MAX_SMPL - 1) * sizeof(tBuf[0]));
+    memmove(hBuf,    hBuf    + 1, (MAX_SMPL - 1) * sizeof(hBuf[0]));
+    timeBuf[MAX_SMPL - 1] = ts;
+    tBuf   [MAX_SMPL - 1] = t;
+    hBuf   [MAX_SMPL - 1] = h;
     if (nLogSmpl > 0) --nLogSmpl;
   }
 }
@@ -564,6 +628,26 @@ void drawClock() {
   tft.endWrite();
 }
 
+// ─── Status line ──────────────────────────────────────────────────────────────
+// WiFi status on the left edge, version on the right.  Repaints the entire
+// 8 px row every call so transitions (N/C → IP) are clean even though the
+// new string is shorter than the old.
+void drawStatus() {
+  String w = (wifi && wifi->isConnected())
+               ? (String("WiFi ") + WiFi.localIP().toString())
+               : String("WiFi N/C");
+
+  tft.startWrite();
+  tft.fillRect(0, STAT_Y, SCR_W, STAT_H, C_BG);
+  tft.setTextColor(TFT_DARKGREY, C_BG);
+  tft.setFont(&fonts::Font0);
+  tft.setTextDatum(lgfx::middle_left);
+  tft.drawString(w, 2, STAT_Y + STAT_H / 2);
+  tft.setTextDatum(lgfx::middle_right);
+  tft.drawString(VERSION_SHORT, SCR_W - 2, STAT_Y + STAT_H / 2);
+  tft.endWrite();
+}
+
 // ─── Graph ────────────────────────────────────────────────────────────────────
 
 void drawGraph() {
@@ -622,40 +706,43 @@ void drawGraph() {
   tft.drawFastVLine(PLT_X + PLT_W, PLT_Y, PLT_H + 1, C_AXIS);
   tft.drawFastHLine(PLT_X, PLT_Y + PLT_H, PLT_W + 1, C_AXIS);
 
-  // ── Time axis labels ──
-  // The buffer mixes log-loaded samples (6-min spacing, same as live) so the
-  // total span is simply nSmpl × SAMPLE_MS.  nLogSmpl tracks eviction of the
-  // startup-loaded records but spacing is uniform throughout.
-  long spanMin = (long)nSmpl * (long)(SAMPLE_MS / 60000UL);
+  // ── Time range from sample timestamps ──
+  // X positions are now in real time, not sample index.  Gaps in coverage
+  // (power outage, missed flushes) become visible as long horizontal line
+  // segments rather than being silently compressed.
+  time_t tStart   = timeBuf[0];
+  time_t tEnd     = timeBuf[nSmpl - 1];
+  long   timeSpan = (long)(tEnd - tStart);
+  if (timeSpan <= 0) timeSpan = 1;   // guard against degenerate single-time data
 
+  // ── Time axis labels: hour-of-day in 12-hr A/P form (e.g. 8A, 1P, 12P) ──
+  // Tick time is rounded to the nearest hour so labels are clean.
   tft.setTextColor(TFT_DARKGREY, C_BG);
   tft.setTextDatum(lgfx::top_center);
   tft.setFont(&fonts::Font0);
   for (int t = 0; t <= 4; t++) {
-    int  xPix   = PLT_X + (int)((long)t * PLT_W / 4);
-    long agoMin = spanMin - (long)t * spanMin / 4;
-    String lbl;
-    if (agoMin == 0) {
-      lbl = "Now";
-    } else if (agoMin < 60) {
-      lbl = "-" + String((int)agoMin) + "m";
-    } else if (agoMin < 1440) {
-      lbl = "-" + String((int)(agoMin / 60)) + "h";
-    } else {
-      lbl = "-" + String((int)(agoMin / 1440)) + "d";
-    }
+    int    xPix     = PLT_X + (int)((long)t * PLT_W / 4);
+    // tickTime is UTC; add rtc.offset so the displayed hour is local.
+    time_t tickTime = tStart + (long)t * timeSpan / 4 + rtc.offset;
+    struct tm tm;
+    gmtime_r(&tickTime, &tm);
+    int h = tm.tm_hour + (tm.tm_min >= 30 ? 1 : 0);  // round to nearest hour
+    if (h >= 24) h = 0;
+    int  h12  = h % 12; if (h12 == 0) h12 = 12;
+    char ampm = (h < 12) ? 'A' : 'P';
+    char lbl[6];
+    snprintf(lbl, sizeof(lbl), "%d%c", h12, ampm);
     tft.drawString(lbl, xPix, PLT_Y + PLT_H + 2);
   }
 
-  // ── Plot lines — raw float samples ──
-  float scale = (float)(nSmpl - 1) / (float)(PLT_W - 1);
-  for (int px = 0; px < PLT_W - 1; px++) {
-    int i1 = constrain((int)roundf( px      * scale), 0, nSmpl - 1);
-    int i2 = constrain((int)roundf((px + 1) * scale), 0, nSmpl - 1);
-    tft.drawLine(PLT_X + px,     valToY(tBuf[i1], tMin, tMax),
-                 PLT_X + px + 1, valToY(tBuf[i2], tMin, tMax), C_TEMP);
-    tft.drawLine(PLT_X + px,     valToY(hBuf[i1], hMin, hMax),
-                 PLT_X + px + 1, valToY(hBuf[i2], hMin, hMax), C_HUMID);
+  // ── Plot lines — connect adjacent samples at their actual time positions ──
+  for (int i = 0; i < nSmpl - 1; i++) {
+    int x1 = PLT_X + (int)((long)(timeBuf[i]     - tStart) * (PLT_W - 1) / timeSpan);
+    int x2 = PLT_X + (int)((long)(timeBuf[i + 1] - tStart) * (PLT_W - 1) / timeSpan);
+    tft.drawLine(x1, valToY(tBuf[i],     tMin, tMax),
+                 x2, valToY(tBuf[i + 1], tMin, tMax), C_TEMP);
+    tft.drawLine(x1, valToY(hBuf[i],     hMin, hMax),
+                 x2, valToY(hBuf[i + 1], hMin, hMax), C_HUMID);
   }
 
   // ── Legend (top-right corner of plot) ──
@@ -673,6 +760,109 @@ void drawGraph() {
   tft.endWrite();
 }
 
+// ─── Panel recovery ───────────────────────────────────────────────────────────
+// Re-runs the LovyanGFX init sequence (SWRESET + full panel init) and redraws
+// everything currently on screen.  Required after any WiFi.begin() attempt on
+// this older single-USB CYD: WiFi association reliably leaves the ILI9341 in
+// a desynced state (white screen / random stripes) regardless of bus_shared,
+// DMA, or freq_write settings.  Called whether the attempt succeeded or
+// failed — the corruption happens at begin() time, not at success/failure.
+void recoverPanel() {
+  Serial.println("Panel: re-init");
+  tft.init();
+  tft.setRotation(1);
+  tft.setBrightness(200);
+  tft.fillScreen(C_BG);
+  drawHeader();
+  drawClock();
+  drawGraph();
+  drawStatus();
+}
+
+// ─── HTTP server ──────────────────────────────────────────────────────────────
+// GET  /         → simple HTML index
+// GET  /log      → stream LOG_PATH as text/csv
+// PUT  /log      → replace LOG_PATH with the request body
+// GET  /config   → stream CONFIG_PATH as text/plain
+// PUT  /config   → replace CONFIG_PATH with the request body
+//
+// PUT bodies are buffered in heap via webServer.arg("plain") — fine for
+// config.ini (~1 KB) but risky for full log replacement (~700 KB vs ~150 KB
+// free heap).  If a large log restore is needed, do it incrementally or rm
+// the file first via the serial command.
+
+void httpHandleRoot() {
+  // curT / curH are NaN until the first 6-minute averaging window completes.
+  // Show "--" in that case rather than the printf default of "nan".
+  char tStr[12], hStr[12];
+  if (isnan(curT)) strcpy(tStr, "--"); else snprintf(tStr, sizeof(tStr), "%.1f", curT);
+  if (isnan(curH)) strcpy(hStr, "--"); else snprintf(hStr, sizeof(hStr), "%.1f", curH);
+
+  String html = F("<html><body><h2>");
+  html += VERSION;
+  html += F("</h2><p>");
+  html += rtc.getTime("%m/%d/%Y %H:%M:%S");
+  html += F("</p><p>Temp: ");
+  html += tStr;
+  html += F(" &deg;F &nbsp; Humidity: ");
+  html += hStr;
+  html += F(" %</p><ul>"
+           "<li><a href=\"/log\">/log</a> &mdash; sample log (CSV)</li>"
+           "<li><a href=\"/config\">/config</a> &mdash; config.ini</li>"
+           "</ul><p>PUT to /log or /config to replace.</p></body></html>");
+  webServer.send(200, "text/html", html);
+}
+
+void httpServeFile(const char* path, const char* mime) {
+  if (!spiffsOk || !SPIFFS.exists(path)) {
+    webServer.send(404, "text/plain", "not found");
+    return;
+  }
+  File f = SPIFFS.open(path, FILE_READ);
+  if (!f) { webServer.send(500, "text/plain", "open failed"); return; }
+  webServer.streamFile(f, mime);
+  f.close();
+}
+
+void httpReplaceFile(const char* path) {
+  if (!spiffsOk) { webServer.send(503, "text/plain", "SPIFFS unavailable"); return; }
+  if (!webServer.hasArg("plain")) {
+    webServer.send(400, "text/plain", "missing body");
+    return;
+  }
+  const String& body = webServer.arg("plain");
+  File f = SPIFFS.open(path, FILE_WRITE);
+  if (!f) { webServer.send(500, "text/plain", "create failed"); return; }
+  size_t n = f.print(body);
+  f.close();
+  String resp = String("wrote ") + n + " bytes\n";
+  webServer.send(200, "text/plain", resp);
+  Serial.printf("HTTP: replaced %s (%u bytes)\n", path, (unsigned)n);
+}
+
+void setupWebServer() {
+  webServer.on("/",       HTTP_GET, httpHandleRoot);
+  webServer.on("/log",    HTTP_GET, [](){ httpServeFile(LOG_PATH,    "text/csv");   });
+  webServer.on("/log",    HTTP_PUT, [](){ httpReplaceFile(LOG_PATH);                });
+  webServer.on("/config", HTTP_GET, [](){ httpServeFile(CONFIG_PATH, "text/plain"); });
+  webServer.on("/config", HTTP_PUT, [](){ httpReplaceFile(CONFIG_PATH);             });
+  webServer.onNotFound([](){ webServer.send(404, "text/plain", "not found"); });
+}
+
+void startWebServer() {
+  if (httpServerActive) return;
+  webServer.begin();
+  httpServerActive = true;
+  Serial.println("HTTP: server started on port 80");
+}
+
+void stopWebServer() {
+  if (!httpServerActive) return;
+  webServer.stop();
+  httpServerActive = false;
+  Serial.println("HTTP: server stopped");
+}
+
 // ─── Scheduler callbacks ──────────────────────────────────────────────────────
 // All periodic work is driven off the RTC via SimpleScheduler.  Each callback
 // fires on a clean wall-clock boundary (e.g. seconds divisible by 10) rather
@@ -681,15 +871,36 @@ void drawGraph() {
 // Every 10 seconds: read the DHT11 and accumulate into the 6-minute averager.
 // Also drives the WiFi state machine on every tick (it expects 1 Hz polling).
 void onSecondTick() {
-  if (wifi) wifi->poll();
+  // ── WiFi lifecycle: drive state machine, watch for transitions ──
+  // The local WiFiSvc.cpp uses 60 s connect timeout and 3600 s backoff, so
+  // each CONNECTING phase ends in either CONNECTED or ERRORTIMEOUT and the
+  // next attempt happens an hour later.  We recover the panel on BOTH
+  // outcomes — WiFi.begin() corrupts the ILI9341 whether or not the
+  // association ultimately succeeds.
+  static WiFiSvc::State prevWifiState = WiFiSvc::DISCONNECTED;
+  if (wifi) {
+    wifi->poll();
+    WiFiSvc::State currState = wifi->state();
+
+    if (prevWifiState == WiFiSvc::CONNECTING && currState == WiFiSvc::CONNECTED) {
+      Serial.println("WiFi: connected — recovering panel");
+      recoverPanel();
+      startWebServer();
+    } else if (prevWifiState == WiFiSvc::CONNECTING && currState == WiFiSvc::ERRORTIMEOUT) {
+      Serial.println("WiFi: 60s connect timeout — recovering panel; 1h backoff");
+      recoverPanel();
+    } else if (prevWifiState == WiFiSvc::CONNECTED && currState != WiFiSvc::CONNECTED) {
+      Serial.println("WiFi: link dropped — stopping HTTP server");
+      stopWebServer();
+    }
+    prevWifiState = currState;
+  }
 
 #if ENABLE_NTP
   // Initial NTP sync: once, the first time WiFi comes up.  begin() runs once
   // for the lifetime of the program; poll() keeps retrying only until the
   // first sync succeeds, then becomes a no-op.  Thereafter the daily resync
-  // from onDayTick is the only NTP traffic.  Run BEFORE the panel-recovery
-  // block so the long tft.init() inside recovery can't push the first NTP
-  // packet past lwIP's ready window.
+  // from onDayTick is the only NTP traffic.
   static bool ntpInitialized = false;
   if (wifi && wifi->isConnected()) {
     if (!ntpInitialized) {
@@ -701,26 +912,11 @@ void onSecondTick() {
   }
 #endif
 
-  // Recover the panel after WiFi associates.  WiFi association on the older
-  // single-USB CYD reliably leaves the ILI9341 in a desynced state (white
-  // screen / random stripes), even when our own SPI accesses are atomic.
-  // Re-running tft.init() once on the rising edge of WiFi connection
-  // issues SWRESET + the full init sequence, restoring the panel; we then
-  // redraw everything that should be on screen.  Sticky: only fires once.
-  static bool panelRecovered = false;
-  if (!panelRecovered && wifi && wifi->isConnected()) {
-    tft.init();
-    tft.setRotation(1);
-    tft.setBrightness(200);
-    tft.fillScreen(C_BG);
-    drawHeader();
-    drawClock();
-    drawGraph();
-    panelRecovered = true;
-  }
-
-  // Refresh the on-screen clock every second.
+  // Refresh the on-screen clock and status row every second.  Both are
+  // small (8–10 px tall) so the cost is trivial and the WiFi line is
+  // automatically up to date even without a transition hook.
   drawClock();
+  drawStatus();
 
   if (rtc.getSecond() % FAST_PERIOD_SEC != 0) return;
 
@@ -748,7 +944,7 @@ void onMinuteTick() {
   accumT = 0.0f;  accumH = 0.0f;  accumCount = 0;
 
   drawHeader();
-  pushSample(curT, curH);
+  pushSample(rtc.getEpoch(), curT, curH);
   drawGraph();
 
   // Stage for next hourly log flush.  Capture the timestamp NOW so the
@@ -763,8 +959,19 @@ void onMinuteTick() {
 }
 
 // Every hour: flush the pending averaged readings to the SPIFFS log.
+// Also reboots the device once a day at 01:00 — appendToLog() runs first
+// so the last hour of data is on disk before restart.  Reboot is gated by
+// the local-hour transition into 1 (onHourTick fires once per hour change),
+// so a single ESP.restart() is issued per day.
 void onHourTick() {
   appendToLog();
+
+  if (rtc.getHour() == 1) {
+    Serial.println("Daily reboot at 01:00");
+    Serial.flush();
+    delay(200);
+    ESP.restart();
+  }
 }
 
 // Daily at 02:00: trim the log if it has grown past the threshold, and
@@ -814,6 +1021,19 @@ void setup() {
     config.get("SSID",     cfgSsid, sizeof(cfgSsid));
     config.get("PASSWORD", cfgPwd,  sizeof(cfgPwd));
 
+    // Time zone offset in hours (signed float, e.g. -8.0 for PST, 5.5 for IST).
+    // Stored on rtc.offset (seconds).  rtc keeps UTC epochs internally — only
+    // its display-format calls (getTime, getHour, …) and the explicit log /
+    // plot formatters apply the offset.  Default 0 if missing → UTC.
+    char tzBuf[16] = "";
+    if (config.get("TimeZoneOffset", tzBuf, sizeof(tzBuf)) && tzBuf[0]) {
+      float hours = atof(tzBuf);
+      rtc.offset  = (long)(hours * 3600.0f);
+      Serial.printf("TimeZoneOffset: %.2f h (%ld s)\n", hours, rtc.offset);
+    } else {
+      Serial.println("TimeZoneOffset: not set, using UTC");
+    }
+
     loadFromSpiffs();   // pre-fill plot buffer with last week of history
     trimLog();          // trim at boot if log is already oversized
   } else {
@@ -845,6 +1065,9 @@ void setup() {
   scheduler.onHour  (onHourTick);
   scheduler.onDay   (onDayTick);
 
+  // Register HTTP routes (server is begun later, only when WiFi is up).
+  setupWebServer();
+
   // Register serial commands.
   cmd.addCommand("showlog", cmdShowLog, "dump log file as CSV (temp,humidity)");
   cmd.addCommand("ls",      lsHandler,  "list SPIFFS files");
@@ -857,6 +1080,7 @@ void setup() {
   drawHeader();
   drawClock();
   drawGraph();
+  drawStatus();
 }
 
 // ─── Loop ─────────────────────────────────────────────────────────────────────
@@ -869,6 +1093,11 @@ void loop() {
     int rc = cmd.execute(String(line));
     if (rc != CMD_OK) Serial.println(cmd.lastErrorMsg());
   }
+
+  // Pump HTTP every loop iteration so client latency isn't gated on the
+  // 1 Hz scheduler tick.  Only active when WiFi is up — see WiFi lifecycle
+  // in onSecondTick(), which calls startWebServer/stopWebServer.
+  if (httpServerActive) webServer.handleClient();
 
   // Fire any due RTC-driven events (fast read, plot, log flush, trim).
   scheduler.poll();

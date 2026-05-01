@@ -1,9 +1,15 @@
 #include "WiFiSvc.h"
 
 // Seconds to wait for an in-progress connect before declaring timeout.
-static const int WIFIWAIT_MAX      = 30;
+// NOTE: this sketch copy diverges from Components/WiFiSvc.cpp.  The canonical
+// component uses 30 / 60.  This sketch needs 60 / 3600 because WiFi.begin()
+// corrupts the ILI9341 panel on this older single-USB CYD; the lifecycle
+// driven from onSecondTick() recovers the panel on every attempt outcome,
+// and the user wants attempts spaced an hour apart so the panel isn't
+// blown away every minute.
+static const int WIFIWAIT_MAX      =   60;   // 1 minute connect timeout
 // Seconds to wait after a connect timeout before retrying.
-static const int WIFIRECONNECT_MAX = 60;
+static const int WIFIRECONNECT_MAX = 3600;   // 1 hour backoff between attempts
 // Seconds to wait after discovering a dropped link before reconnecting.
 static const int WIFIDISCOWAIT_MAX = 10;
 
