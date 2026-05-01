@@ -74,8 +74,8 @@
 #include "Smoother.h"
 
 // ─── Version ──────────────────────────────────────────────────────────────────
-#define VERSION       "TempHumidityDisplay v4.1  30-Apr-2026"
-#define VERSION_SHORT "v4.1"
+#define VERSION       "TempHumidityDisplay v4.2  30-Apr-2026"
+#define VERSION_SHORT "v4.2"
 
 // Diagnostic: set to 0 to disable all NTP traffic (begin/poll/sync).
 // WiFi still associates so we can isolate whether the display corruption is
@@ -798,10 +798,21 @@ void httpHandleRoot() {
   if (isnan(curT)) strcpy(tStr, "--"); else snprintf(tStr, sizeof(tStr), "%.1f", curT);
   if (isnan(curH)) strcpy(hStr, "--"); else snprintf(hStr, sizeof(hStr), "%.1f", curH);
 
+  uint32_t up = millis() / 1000;
+  uint32_t d  = up / 86400;
+  uint32_t h  = (up % 86400) / 3600;
+  uint32_t m  = (up % 3600)  / 60;
+  uint32_t s  = up % 60;
+  char upStr[32];
+  snprintf(upStr, sizeof(upStr), "%lud %luh %lum %lus",
+           (unsigned long)d, (unsigned long)h, (unsigned long)m, (unsigned long)s);
+
   String html = F("<html><body><h2>");
   html += VERSION;
   html += F("</h2><p>");
   html += rtc.getTime("%m/%d/%Y %H:%M:%S");
+  html += F("</p><p>Uptime: ");
+  html += upStr;
   html += F("</p><p>Temp: ");
   html += tStr;
   html += F(" &deg;F &nbsp; Humidity: ");
