@@ -51,7 +51,7 @@
  *  x6) going to need a config file with wifi ssid, pwd, ftp user/pwd
  *  7) Already have a command interpreter, perhaps add telnet as well?
  *  x8) components to use - NtpSync,  WiFi service,  telnetserver, rgb, simplescheduler, configurationfile,delimitedstringparser
- *  9) reboot every day at midnight or 2am
+ *  x9) reboot every day at midnight or 2am
  */
 
 #include "ESP32_SPI_9341.h"   // LovyanGFX + CYD pin/panel config
@@ -74,8 +74,8 @@
 #include "Smoother.h"
 
 // ─── Version ──────────────────────────────────────────────────────────────────
-#define VERSION       "TempHumidityDisplay v4.2  30-Apr-2026"
-#define VERSION_SHORT "v4.2"
+#define VERSION       "TempHumidityDisplay v4.3  01-May-2026"
+#define VERSION_SHORT "v4.3"
 
 // Diagnostic: set to 0 to disable all NTP traffic (begin/poll/sync).
 // WiFi still associates so we can isolate whether the display corruption is
@@ -145,6 +145,10 @@ static const int CLK_H = 10;
 
 // 1 week of records loaded into the plot buffer on startup.
 static const int LOG_WEEK_RECS  = 7 * 24 * (int)SAMPLES_PER_HOUR;
+
+// Width of the plot's time window — also the cutoff used by loadFromSpiffs()
+// to drop stale log entries (see "Stale-entry filter" below).
+static const time_t PLOT_WINDOW_SEC = 7L * 86400L;
 
 // Trim policy: byte-based since records are now variable-length ASCII.
 // At ~30 bytes/record this is roughly: threshold ≈ 14 weeks, chunk ≈ 1 week.
@@ -367,11 +371,65 @@ int helpHandler(const DelimitedStringParser& args, String& errMsg) {
 
 // ─── SPIFFS helpers ───────────────────────────────────────────────────────────
 
+// Scan the log file for the newest timestamp present and return it as a UTC
+// epoch.  Falls back to 2026-01-01 00:00:01 UTC (the same value setup() seeds
+// the RTC with) if SPIFFS is unavailable, the file is missing or empty, or no
+// line parses.  Used in setup() after the config file has set rtc.offset to
+// advance the RTC past the boot seed so timestamps stay monotonic across the
+// gap between power-up and the first NTP sync.  NTP overrides this later if
+// it succeeds.
+//
+// Log lines are written in local time by appendToLog(), so the parsed value
+// is converted back to UTC by subtracting rtc.offset — matches what
+// loadFromSpiffs() does.
+time_t findNewestLogTimestamp() {
+  // 2026-01-01 00:00:01 UTC; same as the rtc.setTime() seed in setup().
+  const time_t defaultEpoch = parseLogTimestamp("20260101-0000") + 1;
+
+  if (!spiffsOk || !SPIFFS.exists(LOG_PATH)) return defaultEpoch;
+  File f = SPIFFS.open(LOG_PATH, FILE_READ);
+  if (!f) return defaultEpoch;
+
+  time_t newest = 0;
+  String line;
+  line.reserve(40);
+  while (f.available()) {
+    char c = (char)f.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      time_t ts = parseLogTimestamp(line.c_str());
+      if (ts > newest) newest = ts;
+      line = "";
+    } else {
+      line += c;
+    }
+  }
+  // Trailing line without a terminating newline (rare but possible).
+  if (line.length() > 0) {
+    time_t ts = parseLogTimestamp(line.c_str());
+    if (ts > newest) newest = ts;
+  }
+  f.close();
+
+  if (newest == 0) return defaultEpoch;
+  return newest - rtc.offset;   // log is local time; return UTC
+}
+
 // On boot: read the last LOG_WEEK_RECS lines from the ASCII log into the
 // sample buffer so the graph is populated immediately.  Two-pass approach:
 // pass 1 counts newlines; pass 2 skips the leading lines we don't need and
 // parses the remainder.  Avoids needing record-offset metadata or holding
 // the whole file in RAM, at the cost of reading the file twice.
+//
+// Stale-entry filter: an entry is dropped unless its timestamp is within
+// [now − PLOT_WINDOW_SEC, now] where now is `rtc.getEpoch()`.  At the boot
+// call, setup() has already advanced the RTC to the newest log timestamp
+// (findNewestLogTimestamp), so "stale" means "older than 7 days before the
+// newest entry on disk" — that's how we drop legacy records like the
+// pre-NTP 2025-12-31 lines a previous failed reboot wrote.  The same filter
+// runs again on the post-NTP reload (reloadAfterNtp), this time against the
+// real wall-clock time, which catches the case where the bootEpoch itself
+// was a stale value.
 void loadFromSpiffs() {
   if (!SPIFFS.exists(LOG_PATH)) {
     Serial.println("SPIFFS: no log file found – starting fresh");
@@ -404,8 +462,13 @@ void loadFromSpiffs() {
     if (f.read() == '\n') toSkip--;
   }
 
+  // Stale-entry filter window: [minEpoch, maxEpoch].
+  time_t maxEpoch = rtc.getEpoch();
+  time_t minEpoch = maxEpoch - PLOT_WINDOW_SEC;
+
   String line;
   line.reserve(40);
+  int    dropped = 0;
   while (f.available() && nSmpl < MAX_SMPL) {
     char c = (char)f.read();
     if (c == '\r') continue;
@@ -419,10 +482,15 @@ void loadFromSpiffs() {
           // The on-disk timestamp is local wall-clock time (see appendToLog).
           // Convert back to UTC for in-memory storage so timeBuf[] stays in
           // a single canonical timezone regardless of future TZ changes.
-          timeBuf[nSmpl] = ts - rtc.offset;
-          tBuf   [nSmpl] = line.substring(c1 + 1, c2).toFloat();
-          hBuf   [nSmpl] = line.substring(c2 + 1).toFloat();
-          nSmpl++;
+          time_t ep = ts - rtc.offset;
+          if (ep < minEpoch || ep > maxEpoch) {
+            dropped++;
+          } else {
+            timeBuf[nSmpl] = ep;
+            tBuf   [nSmpl] = line.substring(c1 + 1, c2).toFloat();
+            hBuf   [nSmpl] = line.substring(c2 + 1).toFloat();
+            nSmpl++;
+          }
         }
       }
       line = "";
@@ -433,8 +501,29 @@ void loadFromSpiffs() {
   f.close();
 
   nLogSmpl = nSmpl;
-  Serial.printf("SPIFFS: loaded %d of %d available records (week capacity %d)\n",
-                nSmpl, totalLines, LOG_WEEK_RECS);
+  Serial.printf("SPIFFS: loaded %d of %d records (dropped %d stale, week capacity %d)\n",
+                nSmpl, totalLines, dropped, LOG_WEEK_RECS);
+}
+
+// Re-load the plot buffer from disk now that the wall-clock is trustworthy.
+// Called once on the first ntp.isSynced() rising edge.  The initial
+// loadFromSpiffs() at boot uses bootEpoch (newest log entry) as the filter
+// reference, which is the right answer when at least one good entry exists
+// on disk but the wrong one when the whole log is stale (e.g. the device
+// rebooted with no network and only wrote junk timestamps for hours).
+// After NTP we know real time, so re-running the load with the same filter
+// against rtc.getEpoch() drops anything older than 7 days from now and
+// catches that case.  appendToLog() is called first so any pendingTime
+// readings from the boot-to-NTP gap are written out and then read back in
+// — without that flush the reset to nSmpl=0 would drop them.
+void reloadAfterNtp() {
+  if (!spiffsOk) return;
+  Serial.println("Reload: post-NTP — flushing pending and re-reading log");
+  appendToLog();
+  nSmpl    = 0;
+  nLogSmpl = 0;
+  loadFromSpiffs();
+  drawGraph();
 }
 
 // Flush the pending buffer to the log file (called every hour).
@@ -658,7 +747,34 @@ void drawGraph() {
   tft.startWrite();
   tft.fillRect(0, GRF_Y, SCR_W, GRF_H, C_BG);
 
-  if (nSmpl < 2) {
+  // Build a sorted index of plottable samples.  Drops anything with a zero
+  // timestamp and (only when the RTC is trustworthy) anything dated in the
+  // future, then sorts ascending by time.  Protects the plot from
+  // out-of-order log entries and from samples captured before NTP fixed
+  // the clock.  The "trustworthy" gate matters at boot: drawGraph() runs at
+  // the end of setup() before NTP has synced, so the RTC is still at its
+  // seed (2026-01-01 00:00:01) and a strict timeBuf[i] <= now would discard
+  // every real log point.  Once NTP syncs, recoverPanel() redraws the graph
+  // and the future-filter then activates.
+  static int idx[MAX_SMPL];
+  time_t now           = rtc.getEpoch();
+  bool   filterFuture  = ntp.isSynced();
+  int n = 0;
+  for (int i = 0; i < nSmpl; i++) {
+    if (timeBuf[i] <= 0) continue;
+    if (filterFuture && timeBuf[i] > now) continue;
+    idx[n++] = i;
+  }
+  // Insertion sort by timestamp; the buffer is mostly already in order.
+  for (int i = 1; i < n; i++) {
+    int    k  = idx[i];
+    time_t kt = timeBuf[k];
+    int    j  = i;
+    while (j > 0 && timeBuf[idx[j - 1]] > kt) { idx[j] = idx[j - 1]; j--; }
+    idx[j] = k;
+  }
+
+  if (n < 2) {
     tft.setTextColor(TFT_DARKGREY, C_BG);
     tft.setTextDatum(lgfx::middle_center);
     tft.setFont(&fonts::Font2);
@@ -668,10 +784,11 @@ void drawGraph() {
   }
 
   // ── Auto-scale temperature Y axis ──
-  float tMin = tBuf[0], tMax = tBuf[0];
-  for (int i = 1; i < nSmpl; i++) {
-    if (tBuf[i] < tMin) tMin = tBuf[i];
-    if (tBuf[i] > tMax) tMax = tBuf[i];
+  float tMin = tBuf[idx[0]], tMax = tBuf[idx[0]];
+  for (int i = 1; i < n; i++) {
+    float v = tBuf[idx[i]];
+    if (v < tMin) tMin = v;
+    if (v > tMax) tMax = v;
   }
   // Guarantee at least a 10 °F span; pad 10 %; snap to 5 °F grid.
   float tSpan = max(tMax - tMin, 10.0f);
@@ -706,12 +823,27 @@ void drawGraph() {
   tft.drawFastVLine(PLT_X + PLT_W, PLT_Y, PLT_H + 1, C_AXIS);
   tft.drawFastHLine(PLT_X, PLT_Y + PLT_H, PLT_W + 1, C_AXIS);
 
-  // ── Time range from sample timestamps ──
-  // X positions are now in real time, not sample index.  Gaps in coverage
-  // (power outage, missed flushes) become visible as long horizontal line
-  // segments rather than being silently compressed.
-  time_t tStart   = timeBuf[0];
-  time_t tEnd     = timeBuf[nSmpl - 1];
+  // ── Time range: rolling 7-day window ending at the newest valid sample ──
+  // Defense in depth: loadFromSpiffs already drops stale entries against the
+  // RTC, but if any slip past (or pushSample picked up a garbage timestamp
+  // before NTP synced), the plot domain would otherwise stretch to span
+  // months and compress real data into a 1-pixel sliver at the left axis.
+  time_t tEnd     = timeBuf[idx[n - 1]];
+  time_t plotMin  = tEnd - PLOT_WINDOW_SEC;
+  int    m = 0;
+  for (int i = 0; i < n; i++) {
+    if (timeBuf[idx[i]] >= plotMin) idx[m++] = idx[i];
+  }
+  n = m;
+  if (n < 2) {
+    tft.setTextColor(TFT_DARKGREY, C_BG);
+    tft.setTextDatum(lgfx::middle_center);
+    tft.setFont(&fonts::Font2);
+    tft.drawString("Collecting data...", SCR_W / 2, GRF_Y + GRF_H / 2);
+    tft.endWrite();
+    return;
+  }
+  time_t tStart   = timeBuf[idx[0]];
   long   timeSpan = (long)(tEnd - tStart);
   if (timeSpan <= 0) timeSpan = 1;   // guard against degenerate single-time data
 
@@ -736,13 +868,15 @@ void drawGraph() {
   }
 
   // ── Plot lines — connect adjacent samples at their actual time positions ──
-  for (int i = 0; i < nSmpl - 1; i++) {
-    int x1 = PLT_X + (int)((long)(timeBuf[i]     - tStart) * (PLT_W - 1) / timeSpan);
-    int x2 = PLT_X + (int)((long)(timeBuf[i + 1] - tStart) * (PLT_W - 1) / timeSpan);
-    tft.drawLine(x1, valToY(tBuf[i],     tMin, tMax),
-                 x2, valToY(tBuf[i + 1], tMin, tMax), C_TEMP);
-    tft.drawLine(x1, valToY(hBuf[i],     hMin, hMax),
-                 x2, valToY(hBuf[i + 1], hMin, hMax), C_HUMID);
+  for (int i = 0; i < n - 1; i++) {
+    int a  = idx[i];
+    int b  = idx[i + 1];
+    int x1 = PLT_X + (int)((long)(timeBuf[a] - tStart) * (PLT_W - 1) / timeSpan);
+    int x2 = PLT_X + (int)((long)(timeBuf[b] - tStart) * (PLT_W - 1) / timeSpan);
+    tft.drawLine(x1, valToY(tBuf[a], tMin, tMax),
+                 x2, valToY(tBuf[b], tMin, tMax), C_TEMP);
+    tft.drawLine(x1, valToY(hBuf[a], hMin, hMax),
+                 x2, valToY(hBuf[b], hMin, hMax), C_HUMID);
   }
 
   // ── Legend (top-right corner of plot) ──
@@ -874,6 +1008,23 @@ void stopWebServer() {
   Serial.println("HTTP: server stopped");
 }
 
+// ─── Reboot ───────────────────────────────────────────────────────────────────
+// Gracefully shut down the network stack before restarting.  Closes any open
+// HTTP sockets, disconnects the WiFi station so the AP gets a deauth instead
+// of a stale association timeout, then powers the radio off and restarts.
+// Used by the daily 01:00 timer in onHourTick and by the boot-button test
+// path in loop().  Does not return.
+void rebootDevice(const char* reason) {
+  Serial.printf("Reboot: %s\n", reason);
+  stopWebServer();
+  if (wifi) wifi->disconnect();
+  WiFi.disconnect(true);   // wifioff=true: drop association and power down radio
+  WiFi.mode(WIFI_OFF);
+  Serial.flush();
+  delay(500);
+  ESP.restart();
+}
+
 // ─── Scheduler callbacks ──────────────────────────────────────────────────────
 // All periodic work is driven off the RTC via SimpleScheduler.  Each callback
 // fires on a clean wall-clock boundary (e.g. seconds divisible by 10) rather
@@ -913,6 +1064,7 @@ void onSecondTick() {
   // first sync succeeds, then becomes a no-op.  Thereafter the daily resync
   // from onDayTick is the only NTP traffic.
   static bool ntpInitialized = false;
+  static bool ntpEverSynced  = false;
   if (wifi && wifi->isConnected()) {
     if (!ntpInitialized) {
       Serial.println("NTP: starting");
@@ -920,6 +1072,14 @@ void onSecondTick() {
       ntpInitialized = true;
     }
     if (!ntp.isSynced()) ntp.poll();
+  }
+  // First-sync rising edge: the wall clock just became trustworthy, so
+  // re-load the plot buffer from disk to drop any stale entries the
+  // boot-time load couldn't recognise (e.g. the whole log was junk because
+  // the previous boot never got NTP).  Runs exactly once per power cycle.
+  if (!ntpEverSynced && ntp.isSynced()) {
+    ntpEverSynced = true;
+    reloadAfterNtp();
   }
 #endif
 
@@ -978,10 +1138,7 @@ void onHourTick() {
   appendToLog();
 
   if (rtc.getHour() == 1) {
-    Serial.println("Daily reboot at 01:00");
-    Serial.flush();
-    delay(200);
-    ESP.restart();
+    rebootDevice("daily 01:00");
   }
 }
 
@@ -1043,6 +1200,18 @@ void setup() {
       Serial.printf("TimeZoneOffset: %.2f h (%ld s)\n", hours, rtc.offset);
     } else {
       Serial.println("TimeZoneOffset: not set, using UTC");
+    }
+
+    // Advance the RTC from the 2026-01-01 seed to the newest timestamp in
+    // the log.  Keeps plot timestamps monotonic across the boot-to-NTP gap;
+    // NTP will overwrite this with real time once WiFi associates.
+    {
+      time_t bootEpoch = findNewestLogTimestamp();
+      struct tm tm;
+      gmtime_r(&bootEpoch, &tm);
+      rtc.setTime(tm.tm_sec, tm.tm_min, tm.tm_hour,
+                  tm.tm_mday, tm.tm_mon + 1, tm.tm_year + 1900);
+      Serial.printf("RTC advanced from log: %s\n", rtc.getDateTime().c_str());
     }
 
     loadFromSpiffs();   // pre-fill plot buffer with last week of history

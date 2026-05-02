@@ -4,6 +4,9 @@ data/config.ini
 # Manual backup zips
 *.zip
 
+# Per-device runtime log
+temphumid.csv
+
 # Arduino IDE / build artifacts
 build/
 *.bin
