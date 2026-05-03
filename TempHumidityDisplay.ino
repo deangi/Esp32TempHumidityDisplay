@@ -6,10 +6,8 @@
  * and a rolling 7-day graph on the bottom ¾.
  *
  * Hardware
- *   ESP32 CYD (Cheap Yellow Display) — single-USB version ESP32-WROOM board
- *   LovyanGFX driver at 40MHz SPI for 2.8" CYD board (Cheap Yellow Display)
- *   (uses older model CYD with single micro-usb port)
- *   (newer models have micro-usb and usb-c, but have different display drivers)
+ *   ESP32 CYD2USB (dual-USB Cheap Yellow Display) — ST7789 panel
+ *   LovyanGFX driver at 40MHz SPI; rotation 3 (USB ports on right)
  *   DHT11 sensor → GPIO 22
  *
  * Libraries  (install via Arduino Library Manager)
@@ -51,7 +49,7 @@
  *  x6) going to need a config file with wifi ssid, pwd, ftp user/pwd
  *  7) Already have a command interpreter, perhaps add telnet as well?
  *  x8) components to use - NtpSync,  WiFi service,  telnetserver, rgb, simplescheduler, configurationfile,delimitedstringparser
- *  x9) reboot every day at midnight or 2am
+ *  9) reboot every day at midnight or 2am xxx - deleted, app doesn't recover after reboot for some reason
  */
 
 #include "ESP32_SPI_9341.h"   // LovyanGFX + CYD pin/panel config
@@ -74,8 +72,8 @@
 #include "Smoother.h"
 
 // ─── Version ──────────────────────────────────────────────────────────────────
-#define VERSION       "TempHumidityDisplay v4.3  01-May-2026"
-#define VERSION_SHORT "v4.3"
+#define VERSION       "TempHumidityDisplay v5.0  02-May-2026 CYD2USB"
+#define VERSION_SHORT "v5.0"
 
 // Diagnostic: set to 0 to disable all NTP traffic (begin/poll/sync).
 // WiFi still associates so we can isolate whether the display corruption is
@@ -701,10 +699,10 @@ void drawHeader() {
 
 // ─── Clock ────────────────────────────────────────────────────────────────────
 // Refreshes only the small date/time strip in the header.  Called once per
-// second from onSecondTick(); cheap because it overwrites only ~10 px tall.
+// minute from onMinuteTick(); cheap because it overwrites only ~10 px tall.
 // Uses 24-hour format (%H, not %I).
 void drawClock() {
-  String dt = rtc.getTime("%m/%d/%Y %H:%M:%S");
+  String dt = rtc.getTime("%m/%d/%Y %H:%M");
 
   // Bracket fillRect + drawString as one atomic SPI session so WiFi
   // interrupts can't slip between them and desync the panel.
@@ -754,7 +752,7 @@ void drawGraph() {
   // the clock.  The "trustworthy" gate matters at boot: drawGraph() runs at
   // the end of setup() before NTP has synced, so the RTC is still at its
   // seed (2026-01-01 00:00:01) and a strict timeBuf[i] <= now would discard
-  // every real log point.  Once NTP syncs, recoverPanel() redraws the graph
+  // every real log point.  Once NTP syncs, reloadAfterNtp() redraws the graph
   // and the future-filter then activates.
   static int idx[MAX_SMPL];
   time_t now           = rtc.getEpoch();
@@ -895,16 +893,16 @@ void drawGraph() {
 }
 
 // ─── Panel recovery ───────────────────────────────────────────────────────────
-// Re-runs the LovyanGFX init sequence (SWRESET + full panel init) and redraws
-// everything currently on screen.  Required after any WiFi.begin() attempt on
-// this older single-USB CYD: WiFi association reliably leaves the ILI9341 in
-// a desynced state (white screen / random stripes) regardless of bus_shared,
-// DMA, or freq_write settings.  Called whether the attempt succeeded or
-// failed — the corruption happens at begin() time, not at success/failure.
+// Re-runs the LovyanGFX init sequence and redraws everything currently on
+// screen.  WiFi.begin() / association still leaves the ST7789 in a desynced
+// state on the CYD2USB (white screen / random stripes) — same symptom as the
+// old ILI9341 board.  Called at the end of setup() (after WiFi.begin()) and
+// on every WiFi state transition that involves a (re)association attempt.
+// vZ80 does the same thing in its netStartupPending_ block.
 void recoverPanel() {
   Serial.println("Panel: re-init");
   tft.init();
-  tft.setRotation(1);
+  tft.setRotation(3);
   tft.setBrightness(200);
   tft.fillScreen(C_BG);
   drawHeader();
@@ -1008,23 +1006,6 @@ void stopWebServer() {
   Serial.println("HTTP: server stopped");
 }
 
-// ─── Reboot ───────────────────────────────────────────────────────────────────
-// Gracefully shut down the network stack before restarting.  Closes any open
-// HTTP sockets, disconnects the WiFi station so the AP gets a deauth instead
-// of a stale association timeout, then powers the radio off and restarts.
-// Used by the daily 01:00 timer in onHourTick and by the boot-button test
-// path in loop().  Does not return.
-void rebootDevice(const char* reason) {
-  Serial.printf("Reboot: %s\n", reason);
-  stopWebServer();
-  if (wifi) wifi->disconnect();
-  WiFi.disconnect(true);   // wifioff=true: drop association and power down radio
-  WiFi.mode(WIFI_OFF);
-  Serial.flush();
-  delay(500);
-  ESP.restart();
-}
-
 // ─── Scheduler callbacks ──────────────────────────────────────────────────────
 // All periodic work is driven off the RTC via SimpleScheduler.  Each callback
 // fires on a clean wall-clock boundary (e.g. seconds divisible by 10) rather
@@ -1036,9 +1017,7 @@ void onSecondTick() {
   // ── WiFi lifecycle: drive state machine, watch for transitions ──
   // The local WiFiSvc.cpp uses 60 s connect timeout and 3600 s backoff, so
   // each CONNECTING phase ends in either CONNECTED or ERRORTIMEOUT and the
-  // next attempt happens an hour later.  We recover the panel on BOTH
-  // outcomes — WiFi.begin() corrupts the ILI9341 whether or not the
-  // association ultimately succeeds.
+  // next attempt happens an hour later.
   static WiFiSvc::State prevWifiState = WiFiSvc::DISCONNECTED;
   if (wifi) {
     wifi->poll();
@@ -1083,12 +1062,6 @@ void onSecondTick() {
   }
 #endif
 
-  // Refresh the on-screen clock and status row every second.  Both are
-  // small (8–10 px tall) so the cost is trivial and the WiFi line is
-  // automatically up to date even without a transition hook.
-  drawClock();
-  drawStatus();
-
   if (rtc.getSecond() % FAST_PERIOD_SEC != 0) return;
 
   float h = dht.readHumidity();
@@ -1101,8 +1074,12 @@ void onSecondTick() {
   }
 }
 
-// Every 6 minutes: average the accumulator, redraw, stage for hourly flush.
+// Every minute: refresh the clock/status strip; on 6-minute boundaries also
+// average the accumulator, redraw the header/graph, and stage for hourly flush.
 void onMinuteTick() {
+  drawClock();
+  drawStatus();
+
   if (rtc.getMinute() % PLOT_PERIOD_MIN != 0) return;
 
   if (accumCount == 0) return;
@@ -1117,6 +1094,11 @@ void onMinuteTick() {
   drawHeader();
   pushSample(rtc.getEpoch(), curT, curH);
   drawGraph();
+  // drawHeader wiped the clock strip (inside the header area); drawGraph
+  // wiped the status line (inside the graph fill area).  Repaint both so
+  // they're not blank until the next onMinuteTick fires ~1 minute later.
+  drawClock();
+  drawStatus();
 
   // Stage for next hourly log flush.  Capture the timestamp NOW so the
   // on-disk record reflects when the reading was averaged, not when the
@@ -1130,16 +1112,8 @@ void onMinuteTick() {
 }
 
 // Every hour: flush the pending averaged readings to the SPIFFS log.
-// Also reboots the device once a day at 01:00 — appendToLog() runs first
-// so the last hour of data is on disk before restart.  Reboot is gated by
-// the local-hour transition into 1 (onHourTick fires once per hour change),
-// so a single ESP.restart() is issued per day.
 void onHourTick() {
   appendToLog();
-
-  if (rtc.getHour() == 1) {
-    rebootDevice("daily 01:00");
-  }
 }
 
 // Daily at 02:00: trim the log if it has grown past the threshold, and
@@ -1159,6 +1133,9 @@ void setup() {
   Serial.begin(115200);
   Serial.println(VERSION);
 
+  setCpuFrequencyMhz(120);
+  Serial.printf("CPU clock: %lu MHz\n", (unsigned long)getCpuFrequencyMhz());
+
   // Seed the RTC to a known sane epoch (2026-01-01 00:00:01) so any timestamp
   // taken before NTP sync is at least monotonic and after the build date.
   // ESP32Time::setTime args are: sec, min, hour, day, month, year.
@@ -1166,14 +1143,8 @@ void setup() {
   Serial.printf("RTC seeded: %s\n", rtc.getDateTime().c_str());
 
   tft.init();
-  tft.setRotation(1);       // landscape; USB port on left
+  tft.setRotation(3);       // landscape; USB ports on right (CYD2USB)
   tft.setBrightness(200);   // LovyanGFX controls backlight via PWM on pin 21
-
-  // Boot color sweep: RED → GREEN → BLUE → BLACK so panel health is
-  // visible before any other code runs.
-  tft.fillScreen(TFT_RED);   delay(500);
-  tft.fillScreen(TFT_GREEN); delay(500);
-  tft.fillScreen(TFT_BLUE);  delay(500);
   tft.fillScreen(C_BG);
 
   dht.begin();
@@ -1257,10 +1228,11 @@ void setup() {
   cmd.addCommand("ap",      apHandler,  "append text to file: ap <file> <text>");
   cmd.addCommand("help",    helpHandler,"list available commands");
 
-  drawHeader();
-  drawClock();
-  drawGraph();
-  drawStatus();
+  // WiFi.begin() above leaves the ST7789 desynced on this board.  Re-init
+  // the panel before the first paint so the boot UI is readable; the WiFi
+  // state-transition handler in onSecondTick will re-init again on the
+  // next CONNECTING→CONNECTED/ERRORTIMEOUT edge.
+  recoverPanel();
 }
 
 // ─── Loop ─────────────────────────────────────────────────────────────────────

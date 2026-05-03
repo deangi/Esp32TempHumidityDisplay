@@ -1,5 +1,7 @@
 #define LGFX_USE_V1
-// ILI 9341 TFT LCD panel 320x240 with touch panel
+// CYD2USB (dual-USB Cheap Yellow Display) — ST7789 320x240 panel + XPT2046 touch.
+// Display + touch pin-outs are identical to the original 1-USB CYD; only the
+// panel driver IC, SPI write clock, RGB order, and bus_shared flag differ.
 //
 #include <LovyanGFX.hpp>
 
@@ -76,7 +78,7 @@
 
 class LGFX : public lgfx::LGFX_Device
 {
-    lgfx::Panel_ILI9341 _panel_instance;
+    lgfx::Panel_ST7789 _panel_instance;
     lgfx::Bus_SPI _bus_instance;
     lgfx::Touch_XPT2046 _touch_instance;
     lgfx::Light_PWM _light_instance;
@@ -90,19 +92,11 @@ public:
             // SPIバスの設定
             cfg.spi_host = HSPI_HOST;  // 使用するSPIを選択  (VSPI_HOST or HSPI_HOST)
             cfg.spi_mode = 0;          // SPI通信モードを設定 (0 ~ 3)
-            // 20 MHz (was 40 MHz).  Lowered after observing white/random-pixel
-            // boots once WiFi STA was added: 40 MHz is marginal on this CYD
-            // when WiFi association introduces SPI timing jitter, and the
-            // display only updates once per second so the extra throughput
-            // is unused.  80 MHz / 4 = 20 MHz is the next safe ESP32 divisor.
-            cfg.freq_write = 10000000;
+            cfg.freq_write = 40000000;
             cfg.freq_read = 16000000;  // 受信時のSPIクロック
             cfg.spi_3wire = true;      // 受信をMOSIピンで行う場合はtrueを設定
             cfg.use_lock = true;       // トランザクションロックを使用する場合はtrueを設定
-            // DMA disabled (was channel 1).  With WiFi STA active the SPI DMA
-            // channel was producing white/random-pixel boots; PIO transfers
-            // are plenty fast for a panel that updates only once per second.
-            cfg.dma_channel = 0;
+            cfg.dma_channel = 1;
             cfg.pin_sclk = LCD_SCK;    // SPIのSCLKピン番号を設定
             cfg.pin_mosi = LCD_MOSI;   // SPIのMOSIピン番号を設定
             cfg.pin_miso = LCD_MISO;   // SPIのMISOピン番号を設定 (-1 = disable)
@@ -132,16 +126,13 @@ public:
             cfg.dummy_read_pixel = 8; // ピクセル読出し前のダミーリードのビット数
             cfg.dummy_read_bits = 1;  // ピクセル以外のデータ読出し前のダミーリードのビット数
             cfg.readable = true;      // データ読出しが可能な場合 trueに設定
+            // CYD2USB (ST7789): LovyanGFX's Panel_ST7789 defaults already
+            // handle this panel's invert state, so leave cfg.invert=false.
+            // R/B are swapped vs RGB default, so rgb_order must be true.
             cfg.invert = false;       // パネルの明暗が反転してしまう場合 trueに設定
-            cfg.rgb_order = false;    // パネルの赤と青が入れ替わってしまう場合 trueに設定
+            cfg.rgb_order = true;     // パネルの赤と青が入れ替わってしまう場合 trueに設定
             cfg.dlen_16bit = false;   // データ長を16bit単位で送信するパネルの場合 trueに設定
-            // bus_shared = false: this sketch does NOT share HSPI with any
-            // other device (touch is on VSPI; SPIFFS is internal flash, not
-            // SD-via-HSPI).  Setting true forces LovyanGFX to release/
-            // re-acquire the bus on every transaction, which leaves a window
-            // where a WiFi-driven interrupt storm can desync CS/DC and put
-            // the panel into a permanent garbage state at WiFi.begin() time.
-            cfg.bus_shared = false;
+            cfg.bus_shared = true;    // matches vZ80 on the same board
 
             _panel_instance.config(cfg);
         }
